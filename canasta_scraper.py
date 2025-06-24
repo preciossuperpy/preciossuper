@@ -3,10 +3,6 @@
 Scraper unificado de precios – versión compatible Py 3.7+
 Autor  : Diego B. Meza · Revisión: 2025-06-24
 """
-
-!pip install -q requests pandas beautifulsoup4 gspread gspread_dataframe PyDrive \
-               typing_extensions unidecode
-
 from __future__ import annotations
 from typing import List, Dict, Sequence, Callable, Set
 from typing_extensions import TypedDict
@@ -39,13 +35,6 @@ tmp_creds = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
 tmp_creds.write(CREDS_RAW.encode())
 tmp_creds.close()
 CREDS_JSON = tmp_creds.name
-
-
-
-
-
-
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1plZ1LzHu2W2TrbV7wXPueWsO2g4dFRyUdpxXIUE5ns8"
 WORKSHEET_NAME  = "maestro"
 
 MAX_WORKERS, REQ_TIMEOUT = 8, 10
