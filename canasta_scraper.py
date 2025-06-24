@@ -27,7 +27,7 @@ from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0) Configuración por entorno
+# 0) Configuración desde variables de entorno
 # ─────────────────────────────────────────────────────────────────────────────
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_RAW       = os.getenv("GOOGLE_CREDS")           # JSON completo en string
@@ -44,7 +44,7 @@ KEY_COLS = ["Supermercado", "CategoríaURL", "Producto", "FechaConsulta"]
 PATTERN_DAILY = os.path.join(OUT_DIR, "*_canasta_*.csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) Funciones de normalización y filtrado
+# 1) Normalización y filtrado
 # ─────────────────────────────────────────────────────────────────────────────
 def strip_accents(txt: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", txt)
@@ -55,15 +55,11 @@ def tokenize(txt: str) -> List[str]:
     return [strip_accents(tok.lower()) for tok in _token_re.findall(txt)]
 
 EXCLUDE_WORDS = [
-    # higiene / farmacia
     "pañal", "pañales", "toallita", "algodón", "curita", "gasas", "jeringa",
     "termometro", "ibuprofeno", "paracetamol", "ampolla", "inyectable",
     "dental", "facial", "crema", "locion", "shampoo",
-    # cosmética
     "perfume", "maquillaje", "labial", "rimel", "colonia", "esmalte",
-    # ferretería
     "herramienta", "martillo", "clavo", "taladro", "pintura", "cable",
-    # varios
     "juguete", "bicicleta", "detergente", "lavavajilla", "alfajor", "alfajores",
     "celulitis", "corporal", "fusifar", "estrias", "aciclovir"
 ]
@@ -119,11 +115,9 @@ def _first_price(node: BeautifulSoup, selectors: List[str] = None) -> float:
 
 def _build_session() -> requests.Session:
     retry = Retry(
-        total=3,
-        backoff_factor=1.2,
+        total=3, backoff_factor=1.2,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "HEAD"),
-        raise_on_status=False,
+        allowed_methods=("GET", "HEAD"), raise_on_status=False
     )
     adapter = HTTPAdapter(max_retries=retry)
     sess = requests.Session()
@@ -179,8 +173,7 @@ class StockScraper(HtmlSiteScraper):
 
     def category_urls(self) -> List[str]:
         try:
-            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
-            r.raise_for_status()
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -193,8 +186,7 @@ class StockScraper(HtmlSiteScraper):
 
     def parse_category(self, url: str) -> List[dict]:
         try:
-            r = self.session.get(url, timeout=REQ_TIMEOUT)
-            r.raise_for_status()
+            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.content, "html.parser")
@@ -225,8 +217,7 @@ class SuperseisScraper(HtmlSiteScraper):
 
     def category_urls(self) -> List[str]:
         try:
-            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
-            r.raise_for_status()
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -239,8 +230,7 @@ class SuperseisScraper(HtmlSiteScraper):
 
     def parse_category(self, url: str) -> List[dict]:
         try:
-            r = self.session.get(url, timeout=REQ_TIMEOUT)
-            r.raise_for_status()
+            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.content, "html.parser")
@@ -263,15 +253,101 @@ class SuperseisScraper(HtmlSiteScraper):
             })
         return rows
 
+class SalemmaScraper(HtmlSiteScraper):
+    def __init__(self):
+        super().__init__("salemma", "https://www.salemmaonline.com.py")
+
+    def category_urls(self) -> List[str]:
+        try:
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        urls = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"].lower()
+            if any(k in href for k in KEYWORDS_SUPER):
+                urls.add(urljoin(self.base_url, a["href"]))
+        return list(urls)
+
+    def parse_category(self, url: str) -> List[dict]:
+        try:
+            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.content, "html.parser")
+        rows = []
+        for f in soup.select("form.productsListForm"):
+            nombre = f.find("input", {"name": "name"}).get("value", "")
+            if is_excluded(nombre):
+                continue
+            grupo = assign_group(nombre)
+            if not grupo:
+                continue
+            precio = norm_price(f.find("input", {"name": "price"}).get("value", ""))
+            rows.append({
+                "Supermercado": "Salemma",
+                "CategoríaURL": url,
+                "Producto": nombre.upper(),
+                "Precio": precio,
+                "Grupo": grupo,
+            })
+        return rows
+
+class AreteScraper(HtmlSiteScraper):
+    def __init__(self):
+        super().__init__("arete", "https://www.arete.com.py")
+
+    def category_urls(self) -> List[str]:
+        try:
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        urls = set()
+        for sel in ("#departments-menu", "#menu-departments-menu-1"):
+            menu = soup.select_one(sel)
+            if not menu:
+                continue
+            for a in menu.select('a[href^="catalogo/"]'):
+                href = a["href"].split("?")[0].lower()
+                if any(k in href for k in KEYWORDS_SUPER):
+                    urls.add(urljoin(self.base_url + "/", a["href"]))
+        return list(urls)
+
+    def parse_category(self, url: str) -> List[dict]:
+        try:
+            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.content, "html.parser")
+        rows = []
+        for p in soup.select("div.product"):
+            nm = p.select_one("h2.ecommercepro-loop-product__title")
+            if not nm:
+                continue
+            nombre = nm.get_text(" ", strip=True)
+            if is_excluded(nombre):
+                continue
+            grupo = assign_group(nombre)
+            if not grupo:
+                continue
+            precio = _first_price(p)
+            rows.append({
+                "Supermercado": "Arete",
+                "CategoríaURL": url,
+                "Producto": nombre.upper(),
+                "Precio": precio,
+                "Grupo": grupo,
+            })
+        return rows
+
 class JardinesScraper(AreteScraper):
     def __init__(self):
         super().__init__()
         self.name = "losjardines"
         self.base_url = "https://losjardinesonline.com.py"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3) Scraper JSON para Biggie
-# ─────────────────────────────────────────────────────────────────────────────
 class BiggieScraper:
     name, API, TAKE = "biggie", "https://api.app.biggie.com.py/api/articles", 100
     GROUPS = ["carniceria", "panaderia", "huevos", "lacteos"]
@@ -307,8 +383,8 @@ class BiggieScraper:
         out = []
         for grp in self.GROUPS:
             for item in self.fetch_group(grp):
-                item["FechaConsulta"] = fecha
-                out.append(item)
+                    item["FechaConsulta"] = fecha
+            out.append(item)
         return out
 
     def save_csv(self, rows: List[dict]) -> None:
@@ -319,15 +395,15 @@ class BiggieScraper:
         pd.DataFrame(rows).to_csv(os.path.join(OUT_DIR, fname), index=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) Mapeo de scrapers disponibles
+# 3) Mapeo de scrapers disponibles
 # ─────────────────────────────────────────────────────────────────────────────
 SCRAPERS: Dict[str, Callable[[], object]] = {
-    "stock":      StockScraper,
-    "superseis":  SuperseisScraper,
-    "salemma":    SalemmaScraper,
-    "arete":      AreteScraper,
-    "losjardines":JardinesScraper,
-    "biggie":     BiggieScraper,
+    "stock":       StockScraper,
+    "superseis":   SuperseisScraper,
+    "salemma":     SalemmaScraper,
+    "arete":       AreteScraper,
+    "losjardines": JardinesScraper,
+    "biggie":      BiggieScraper,
 }
 
 def _parse_args(argv: Sequence[str] | None = None) -> List[str]:
@@ -346,7 +422,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> List[str]:
     return chosen or list(SCRAPERS.keys())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) Helpers Google Sheets
+# 4) Helpers Google Sheets
 # ─────────────────────────────────────────────────────────────────────────────
 def _open_sheet():
     scopes = [
@@ -369,7 +445,7 @@ def _write_sheet(ws, df: pd.DataFrame) -> None:
     set_with_dataframe(ws, df, include_index=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) Orquestador principal
+# 5) Orquestador principal
 # ─────────────────────────────────────────────────────────────────────────────
 def main(argv: Sequence[str] | None = None) -> int:
     sitios = _parse_args(argv if argv is not None else sys.argv[1:])
@@ -386,11 +462,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Sin datos nuevos.")
         return 0
 
-    # Leer todos los CSV históricos + nuevos
-    df_list = [pd.read_csv(fp, dtype=str) for fp in glob.glob(PATTERN_DAILY)]
-    df_all  = pd.concat(df_list, ignore_index=True, sort=False)
-
-    # Normalizar columnas
+    # Leer y concatenar todos los CSV generados
+    df_all = pd.concat(
+        [pd.read_csv(fp, dtype=str) for fp in glob.glob(PATTERN_DAILY)],
+        ignore_index=True, sort=False
+    )
+    # Normalizar
     df_all["Grupo"] = df_all["Grupo"].map(strip_accents).fillna("")
     df_all["Precio"] = pd.to_numeric(df_all["Precio"], errors="coerce")
 
@@ -398,22 +475,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     ws, df_prev = _open_sheet()
     base = pd.concat([df_prev, df_all], ignore_index=True, sort=False)
 
-    # Fecha y deduplicación
+    # Ordenar y deduplicar
     base["FechaConsulta"] = pd.to_datetime(base["FechaConsulta"], errors="coerce", dayfirst=True)
     base.sort_values("FechaConsulta", inplace=True)
     base["FechaConsulta"] = base["FechaConsulta"].dt.strftime("%Y-%m-%d")
     base.drop_duplicates(KEY_COLS, keep="first", inplace=True)
     base.reset_index(drop=True, inplace=True)
 
-    # Quitar ID previo y reasignar
+    # Reasignar ID
     if "ID" in base.columns:
         base.drop(columns=["ID"], inplace=True)
     base.insert(0, "ID", range(1, len(base) + 1))
 
-    # Escribir de vuelta
     _write_sheet(ws, base)
     print(f"✅ Hoja '{WORKSHEET_NAME}' actualizada: {len(base)} filas totales")
     return 0
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
