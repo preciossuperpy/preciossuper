@@ -6,7 +6,6 @@ Autor: Diego B. Meza · Revisión: 2025-06-24
 Compatible: Python 3.7+
 """
 
-from __future__ import annotations
 import os
 import sys
 import glob
@@ -137,7 +136,7 @@ def _build_session() -> requests.Session:
     return sess
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) Definición de scrapers HTML
+# 2) Scrapers HTML
 # ─────────────────────────────────────────────────────────────────────────────
 KEYWORDS_SUPER = set().union(*GROUP_TOKENS.values())
 
@@ -180,7 +179,8 @@ class StockScraper(HtmlSiteScraper):
 
     def category_urls(self) -> List[str]:
         try:
-            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -193,7 +193,8 @@ class StockScraper(HtmlSiteScraper):
 
     def parse_category(self, url: str) -> List[dict]:
         try:
-            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
+            r = self.session.get(url, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.content, "html.parser")
@@ -224,7 +225,8 @@ class SuperseisScraper(HtmlSiteScraper):
 
     def category_urls(self) -> List[str]:
         try:
-            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -237,7 +239,8 @@ class SuperseisScraper(HtmlSiteScraper):
 
     def parse_category(self, url: str) -> List[dict]:
         try:
-            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
+            r = self.session.get(url, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
         except Exception:
             return []
         soup = BeautifulSoup(r.content, "html.parser")
@@ -253,95 +256,6 @@ class SuperseisScraper(HtmlSiteScraper):
             precio = _first_price(cont, ["span.price-label", "span.price"])
             rows.append({
                 "Supermercado": "Superseis",
-                "CategoríaURL": url,
-                "Producto": nombre.upper(),
-                "Precio": precio,
-                "Grupo": grupo,
-            })
-        return rows
-
-class SalemmaScraper(HtmlSiteScraper):
-    def __init__(self):
-        super().__init__("salemma", "https://www.salemmaonline.com.py")
-
-    def category_urls(self) -> List[str]:
-        try:
-            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
-        except Exception:
-            return []
-        soup = BeautifulSoup(r.text, "html.parser")
-        urls = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].lower()
-            if any(k in href for k in KEYWORDS_SUPER):
-                urls.add(urljoin(self.base_url, a["href"]))
-        return list(urls)
-
-    def parse_category(self, url: str) -> List[dict]:
-        try:
-            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
-        except Exception:
-            return []
-        soup = BeautifulSoup(r.content, "html.parser")
-        rows = []
-        for f in soup.select("form.productsListForm"):
-            nombre = f.find("input", {"name": "name"}).get("value", "")
-            if is_excluded(nombre):
-                continue
-            grupo = assign_group(nombre)
-            if not grupo:
-                continue
-            precio = norm_price(f.find("input", {"name": "price"}).get("value", ""))
-            rows.append({
-                "Supermercado": "Salemma",
-                "CategoríaURL": url,
-                "Producto": nombre.upper(),
-                "Precio": precio,
-                "Grupo": grupo,
-            })
-        return rows
-
-class AreteScraper(HtmlSiteScraper):
-    def __init__(self):
-        super().__init__("arete", "https://www.arete.com.py")
-
-    def category_urls(self) -> List[str]:
-        try:
-            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT); r.raise_for_status()
-        except Exception:
-            return []
-        soup = BeautifulSoup(r.text, "html.parser")
-        urls = set()
-        for sel in ("#departments-menu", "#menu-departments-menu-1"):
-            menu = soup.select_one(sel)
-            if not menu:
-                continue
-            for a in menu.select('a[href^="catalogo/"]'):
-                href = a["href"].split("?")[0].lower()
-                if any(k in href for k in KEYWORDS_SUPER):
-                    urls.add(urljoin(self.base_url + "/", a["href"]))
-        return list(urls)
-
-    def parse_category(self, url: str) -> List[dict]:
-        try:
-            r = self.session.get(url, timeout=REQ_TIMEOUT); r.raise_for_status()
-        except Exception:
-            return []
-        soup = BeautifulSoup(r.content, "html.parser")
-        rows = []
-        for p in soup.select("div.product"):
-            nm = p.select_one("h2.ecommercepro-loop-product__title")
-            if not nm:
-                continue
-            nombre = nm.get_text(" ", strip=True)
-            if is_excluded(nombre):
-                continue
-            grupo = assign_group(nombre)
-            if not grupo:
-                continue
-            precio = _first_price(p)
-            rows.append({
-                "Supermercado": "Arete",
                 "CategoríaURL": url,
                 "Producto": nombre.upper(),
                 "Precio": precio,
