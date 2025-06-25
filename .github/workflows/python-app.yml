@@ -25,6 +25,7 @@ jobs:
       - name: Execute scraper
         # NO pasamos OUT_DIR aquí; el script usará "/tmp/csvs" si no existe
         env:
+          OUT_DIR: /tmp/csvs
           GOOGLE_CREDS:    ${{ secrets.GOOGLE_CREDS }}
           SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
         run: |
