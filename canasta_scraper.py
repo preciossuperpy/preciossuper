@@ -29,9 +29,23 @@ from google.oauth2.service_account import Credentials
 # ─────────────────────────────────────────────────────────────────────────────
 # 0) Configuración desde variables de entorno (con fallback para OUT_DIR)
 # ─────────────────────────────────────────────────────────────────────────────
-SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-CREDS_RAW       = os.getenv("GOOGLE_CREDS")           # JSON de service-account
-OUT_DIR         = os.getenv("OUT_DIR") or "/tmp/csvs"  # fallback si está vacío
+ # ─────────────────────────────────────────────────────────────────────────────
+ # 0) Configuración desde variables de entorno (con fallback para OUT_DIR)
+ # ─────────────────────────────────────────────────────────────────────────────
+ SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
+ CREDS_RAW       = os.getenv("GOOGLE_CREDS")           # JSON de service-account
+-OUT_DIR         = os.getenv("OUT_DIR") or "/tmp/csvs"  # fallback si está vacío
++OUT_DIR         = os.getenv("OUT_DIR") or "/tmp/csvs"  # fallback si está vacío
+
++# ────────────────────────────────────────────────────────────────────────────
++# Desactivar guardado de CSV cuando corra en GitHub Actions
++SAVE_CSV = os.getenv("GITHUB_ACTIONS", "false").lower() != "true"
++# ────────────────────────────────────────────────────────────────────────────
+
+ # volcamos las credenciales a un JSON temporal
+ with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+     tmp.write(CREDS_RAW.encode())
+     CREDS_JSON = tmp.name
 
 # volcamos las credenciales a un JSON temporal
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
@@ -451,12 +465,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     sitios = _parse_args(argv if argv is not None else sys.argv[1:])
     all_records: List[dict] = []
 
-    for key in sitios:
+        for key in sitios:
         scraper = SCRAPERS[key]()
         recs = scraper.scrape()
-        scraper.save_csv(recs)
++       if SAVE_CSV:
++           scraper.save_csv(recs)
         all_records.extend(recs)
         print(f"• {key:<12}: {len(recs):>5} filas")
+
 
     if not all_records:
         print("Sin datos nuevos.")
