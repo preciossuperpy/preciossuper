@@ -31,7 +31,10 @@ from google.oauth2.service_account import Credentials
 # ─────────────────────────────────────────────────────────────────────────────
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_RAW       = os.getenv("GOOGLE_CREDS")          # JSON de service-account
-OUT_DIR         = os.getenv("OUT_DIR", "/tmp/csvs")  # carpeta local para CSV
+# Si OUT_DIR no está definido o está vacío, usar /tmp/csvs
+_out = os.getenv("OUT_DIR")
+OUT_DIR = _out if _out else "/tmp/csvs"
+
 
 # volcamos las credenciales a un JSON temporal
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
