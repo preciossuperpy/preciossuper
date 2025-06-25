@@ -29,15 +29,20 @@ from google.oauth2.service_account import Credentials
 # ─────────────────────────────────────────────────────────────────────────────
 # 0) Configuración desde variables de entorno (una sola sección)
 # ─────────────────────────────────────────────────────────────────────────────
+# 0) Configuración desde variables de entorno (una sola sección)
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-CREDS_RAW       = os.getenv("GOOGLE_CREDS")                     # JSON de service-account
+CREDS_RAW       = os.getenv("GOOGLE_CREDS")  # JSON de service-account
+
 # Fallback de OUT_DIR: si la var existe pero está vacía, usar /tmp/csvs
 OUT_DIR = os.getenv("OUT_DIR") or "/tmp/csvs"
-# Crear ruta de salida de CSV de una vez
-os.makedirs(OUT_DIR, exist_ok=True)
 
-# Control de guardado de CSV (no guardar en GitHub Actions para evitar error de OUT_DIR vacío)
+if not OUT_DIR.strip():
+    OUT_DIR = "/tmp/csvs"
+
+# Crear ruta de salida de CSV de una vez (sólo si realmente se va a usar)
 SAVE_CSV = os.getenv("GITHUB_ACTIONS", "false").lower() != "true"
+if SAVE_CSV:
+    os.makedirs(OUT_DIR, exist_ok=True)
 
 # Volcar las credenciales a un archivo temporal
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
