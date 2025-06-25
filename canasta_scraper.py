@@ -33,7 +33,9 @@ SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_RAW       = os.getenv("GOOGLE_CREDS")          # JSON de service-account
 # Si OUT_DIR no está definido o está vacío, usar /tmp/csvs
 _out = os.getenv("OUT_DIR")
-OUT_DIR = _out if _out else "/tmp/csvs"
+# Después
+OUT_DIR = os.getenv("OUT_DIR") or "/tmp/csvs"
+
 
 
 # volcamos las credenciales a un JSON temporal
