@@ -1,18 +1,14 @@
 name: Scraper Canasta
 
 on:
-  # a) Ejecución automática: lunes-sábado a las 07 h 30 (Asunción −03),
-  #    que equivale a 10 h 30 UTC
   schedule:
-    - cron:  '30 10 * * 1-6'
-  # b) Lanzamiento manual desde la pestaña ‘Actions’
+    - cron:  '30 10 * * 1-6'   # lunes–sábado 07:30 Asunción (10:30 UTC)
   workflow_dispatch:
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
     steps:
-
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -23,18 +19,20 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Execute scraper
+        # NO pasamos OUT_DIR aquí; el script usará "/tmp/csvs" si no existe
         env:
-          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+          GOOGLE_CREDS:    ${{ secrets.GOOGLE_CREDS }}
           SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
-          OUT_DIR: ${{ secrets.OUT_DIR }}
         run: |
           python canasta_scraper.py
 
-      # (opcional) Publicar CSVs como artefactos para inspección
       - name: Upload CSV artifacts
-        if: success() && env.OUT_DIR != ''
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: canasta-csvs
-          path: ${{ env.OUT_DIR }}/*.csv
+          path: /tmp/csvs/*.csv
