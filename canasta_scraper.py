@@ -32,7 +32,7 @@ from google.oauth2.service_account import Credentials
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_RAW       = os.getenv("GOOGLE_CREDS")                     # JSON de service-account
 # Fallback de OUT_DIR: si la var existe pero está vacía, usar /tmp/csvs
-OUT_DIR         = os.getenv("OUT_DIR") or "/tmp/csvs"
+OUT_DIR = os.getenv("OUT_DIR") or "/tmp/csvs"
 # Crear ruta de salida de CSV de una vez
 os.makedirs(OUT_DIR, exist_ok=True)
 
