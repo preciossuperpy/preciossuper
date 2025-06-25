@@ -27,16 +27,11 @@ from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0) Configuración desde variables de entorno
+# 0) Configuración desde variables de entorno (con fallback para OUT_DIR)
 # ─────────────────────────────────────────────────────────────────────────────
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
-CREDS_RAW       = os.getenv("GOOGLE_CREDS")          # JSON de service-account
-# Si OUT_DIR no está definido o está vacío, usar /tmp/csvs
-_out = os.getenv("OUT_DIR")
-# Después
-OUT_DIR = os.getenv("OUT_DIR") or "/tmp/csvs"
-
-
+CREDS_RAW       = os.getenv("GOOGLE_CREDS")           # JSON de service-account
+OUT_DIR         = os.getenv("OUT_DIR") or "/tmp/csvs"  # fallback si está vacío
 
 # volcamos las credenciales a un JSON temporal
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
@@ -119,9 +114,12 @@ def _first_price(node: BeautifulSoup, selectors: List[str] = None) -> float:
     return 0.0
 
 def _build_session() -> requests.Session:
-    retry = Retry(total=3, backoff_factor=1.2,
-                  status_forcelist=(429,500,502,503,504),
-                  allowed_methods=("GET","HEAD"), raise_on_status=False)
+    retry = Retry(
+        total=3, backoff_factor=1.2,
+        status_forcelist=(429,500,502,503,504),
+        allowed_methods=("GET","HEAD"),
+        raise_on_status=False
+    )
     adapter = HTTPAdapter(max_retries=retry)
     sess = requests.Session()
     sess.headers["User-Agent"] = (
@@ -133,7 +131,7 @@ def _build_session() -> requests.Session:
     return sess
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) Definición de scrapers HTML
+# 2) Scrapers HTML
 # ─────────────────────────────────────────────────────────────────────────────
 KEYWORDS_SUPER = set().union(*GROUP_TOKENS.values())
 
@@ -181,11 +179,11 @@ class StockScraper(HtmlSiteScraper):
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
-        urls = set()
-        for a in soup.select('a[href*="/category/"]'):
-            href = a["href"].lower()
-            if any(k in href for k in KEYWORDS_SUPER):
-                urls.add(urljoin(self.base_url, a["href"]))
+        urls = {
+            urljoin(self.base_url, a["href"])
+            for a in soup.select('a[href*="/category/"]')
+            if any(k in a["href"].lower() for k in KEYWORDS_SUPER)
+        }
         return list(urls)
 
     def parse_category(self, url: str) -> List[dict]:
@@ -227,11 +225,11 @@ class SuperseisScraper(HtmlSiteScraper):
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
-        urls = set()
-        for a in soup.select('a.collapsed[href*="/category/"]'):
-            href = a["href"].lower()
-            if any(k in href for k in KEYWORDS_SUPER):
-                urls.add(urljoin(self.base_url, a["href"]))
+        urls = {
+            urljoin(self.base_url, a["href"])
+            for a in soup.select('a.collapsed[href*="/category/"]')
+            if any(k in a["href"].lower() for k in KEYWORDS_SUPER)
+        }
         return list(urls)
 
     def parse_category(self, url: str) -> List[dict]:
@@ -271,11 +269,11 @@ class SalemmaScraper(HtmlSiteScraper):
         except Exception:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
-        urls = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].lower()
-            if any(k in href for k in KEYWORDS_SUPER):
-                urls.add(urljoin(self.base_url, a["href"]))
+        urls = {
+            urljoin(self.base_url, a["href"])
+            for a in soup.find_all("a", href=True)
+            if any(k in a["href"].lower() for k in KEYWORDS_SUPER)
+        }
         return list(urls)
 
     def parse_category(self, url: str) -> List[dict]:
@@ -369,7 +367,7 @@ class BiggieScraper:
         while True:
             js = self.session.get(
                 self.API,
-                params={"take": self.TAKE, "skip": skip, "classificationName": grp},
+                params={"take":self.TAKE,"skip":skip,"classificationName":grp},
                 timeout=REQ_TIMEOUT
             ).json()
             for it in js.get("items", []):
@@ -420,18 +418,20 @@ SCRAPERS: Dict[str, Callable[[], object]] = {
 def _parse_args(argv: Sequence[str] | None = None) -> List[str]:
     if argv is None:
         return list(SCRAPERS.keys())
-    flat = []
+    flat: List[str] = []
     for a in argv:
         flat.extend(a if isinstance(a,(list,tuple)) else [a])
     if any(x in ("-h","--help") for x in flat):
-        print("Uso: python canasta_scraper.py [sitio1 sitio2 ...]")
+        print("Uso: python canasta_scraper.py [sitio1 sitio2 …]")
         sys.exit(0)
     sel = [x for x in flat if x in SCRAPERS]
     return sel or list(SCRAPERS.keys())
 
 def _open_sheet():
-    scopes = ["https://www.googleapis.com/auth/drive",
-              "https://www.googleapis.com/auth/spreadsheets"]
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
     creds = Credentials.from_service_account_file(CREDS_JSON, scopes=scopes)
     gc = gspread.authorize(creds)
     sh = gc.open_by_url(SPREADSHEET_URL)
@@ -450,31 +450,38 @@ def _write_sheet(ws, df: pd.DataFrame) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     sitios = _parse_args(argv if argv is not None else sys.argv[1:])
     all_records: List[dict] = []
+
     for key in sitios:
         scraper = SCRAPERS[key]()
         recs = scraper.scrape()
         scraper.save_csv(recs)
         all_records.extend(recs)
         print(f"• {key:<12}: {len(recs):>5} filas")
+
     if not all_records:
         print("Sin datos nuevos.")
         return 0
+
     df_all = pd.concat(
         [pd.read_csv(fp, dtype=str) for fp in glob.glob(PATTERN_DAILY)],
         ignore_index=True, sort=False
     )
     df_all["Grupo"] = df_all["Grupo"].map(strip_accents).fillna("")
     df_all["Precio"] = pd.to_numeric(df_all["Precio"], errors="coerce")
+
     ws, df_prev = _open_sheet()
     base = pd.concat([df_prev, df_all], ignore_index=True, sort=False)
+
     base["FechaConsulta"] = pd.to_datetime(base["FechaConsulta"], errors="coerce", dayfirst=True)
     base.sort_values("FechaConsulta", inplace=True)
     base["FechaConsulta"] = base["FechaConsulta"].dt.strftime("%Y-%m-%d")
     base.drop_duplicates(KEY_COLS, keep="first", inplace=True)
     base.reset_index(drop=True, inplace=True)
+
     if "ID" in base.columns:
         base.drop(columns=["ID"], inplace=True)
-    base.insert(0, "ID", range(1, len(base)+1))
+    base.insert(0, "ID", range(1, len(base) + 1))
+
     _write_sheet(ws, base)
     print(f"✅ Hoja '{WORKSHEET_NAME}' actualizada: {len(base)} filas totales")
     return 0
