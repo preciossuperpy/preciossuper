@@ -32,8 +32,14 @@ from google.oauth2.service_account import Credentials
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_RAW       = os.getenv("GOOGLE_CREDS")                     # JSON de service-account
 # Fallback de OUT_DIR: si la var existe pero está vacía, usar /tmp/csvs
-OUT_DIR         = os.getenv("OUT_DIR") or "/tmp/csvs"
+OUT_DIR = os.getenv("OUT_DIR") or "/tmp/csvs"
 # Crear ruta de salida de CSV de una vez
+
+if OUT_DIR:
+    os.makedirs(OUT_DIR, exist_ok=True)
+else:
+    raise ValueError("OUT_DIR environment variable is not set or is empty.")
+    
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Control de guardado de CSV (no guardar en GitHub Actions para evitar error de OUT_DIR vacío)
