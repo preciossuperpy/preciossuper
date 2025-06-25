@@ -4,9 +4,6 @@ Scraper unificado de precios – versión compatible Py 3.7+
 Autor  : Diego B. Meza · Revisión: 2025-06-24
 """
 
-!pip install -q requests pandas beautifulsoup4 gspread gspread_dataframe PyDrive \
-               typing_extensions unidecode
-
 from __future__ import annotations
 from typing import List, Dict, Sequence, Callable, Set
 from typing_extensions import TypedDict
