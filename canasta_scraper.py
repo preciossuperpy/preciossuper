@@ -21,7 +21,13 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+
 import gspread
+
+gc = gspread.service_account(filename=os.environ['GOOGLE_APPLICATION_CREDENTIALS'])
+sh = gc.open_by_url(os.environ['SPREADSHEET_URL'])
+
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from google.oauth2.service_account import Credentials
 
