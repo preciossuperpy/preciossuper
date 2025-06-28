@@ -75,6 +75,29 @@ EXCLUDE_SET: Set[str] = {strip_accents(w) for w in EXCLUDE_PRODUCT_WORDS}
 
 def is_excluded(name: str) -> bool:
     return any(tok in EXCLUDE_SET for tok in tokenize(name))
+# Nueva estructura de clasificación
+CATEGORY_RULES = {
+    "Carnicería": {
+        "include": ["carne", "vacuno", "cerdo", "pollo", "pavo", "cordero", "pescado", "marisco", 
+                   "hamburguesa", "salchicha", "chorizo", "mortadela", "milanesa", "chuleta"],
+        "exclude": ["conserva", "enlatado", "salsa", "galleta"]
+    },
+    "Panadería": {
+        "include": ["pan", "baguette", "factura", "medialuna", "croissant", "bizcocho", "budin", 
+                   "torta", "galleta", "prepizza", "pizza", "chipa", "tostada"],
+        "exclude": ["molde", "bandeja", "juguete"]
+    },
+    "Huevos": {
+        "include": ["huevo"],
+        "exclude": ["pascua", "chocolate", "dulce", "juguete", "decorado"],
+        "require_exact": True  # Solo coincide si es exactamente "huevo" o "huevos"
+    },
+    "Lácteos": {
+        "include": ["leche", "yogur", "queso", "manteca", "crema", "quesillo", "ricotta", "muzzarella"],
+        "exclude": ["crema para", "crema facial", "jabón", "shampoo"]
+    }
+}
+
 
 GROUP_BY_PRODUCT: Dict[str, List[str]] = {
     "verduras": ["lechuga", "tomate", "cerdo", "pollo", "ave", "pescado",
@@ -88,10 +111,26 @@ GROUP_TOKENS = {g: {strip_accents(w) for w in ws}
                 for g, ws in GROUP_BY_PRODUCT.items()}
 
 def assign_group(name: str) -> str | None:
-    toks = set(tokenize(name))
-    for g, ks in GROUP_TOKENS.items():
-        if toks & ks:
-            return g
+    name_lower = name.lower()
+    tokens = set(tokenize(name))
+    
+    for category, rules in CATEGORY_RULES.items():
+        # Verificar exclusiones primero
+        if any(excl in name_lower for excl in rules.get("exclude", [])):
+            continue
+            
+        # Manejar casos que requieren coincidencia exacta
+        if rules.get("require_exact", False):
+            if any(inc == "huevo" for inc in rules["include"]):
+                if "huevo" in tokens or "huevos" in tokens:
+                    return category
+            continue
+            
+        # Coincidencia normal
+        include_keywords = rules["include"]
+        if any(inc in name_lower for inc in include_keywords):
+            return category
+            
     return None
 
 def norm_price(val) -> float:
