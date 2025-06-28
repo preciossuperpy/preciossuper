@@ -2,8 +2,11 @@ name: Daily Price Scraper
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Ejecutar diariamente a medianoche UTC
-  workflow_dispatch:       # Permitir ejecución manual
+    # Ejecutar cada día a las 08:00 UTC (05:00 en Asunción si –03)
+    - cron: '0 8 * * *'
+    # Ejecutar cada día a las 20:00 UTC (17:00 en Asunción si –03)
+    - cron: '0 20 * * *'
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -12,24 +15,23 @@ jobs:
       OUT_DIR: ./csvs
       SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
       GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
-      
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-    - name: Run Scraper
-      run: python canasta_scraper.py
+      - name: Run Scraper
+        run: python canasta_scraper.py
 
-    - name: Upload CSV artifacts
-      uses: actions/upload-artifact@v4  # Cambiado de v3 a v4
-      with:
-        name: price-csvs
-        path: ${{ env.OUT_DIR }}/*.csv
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-csvs
+          path: ${{ env.OUT_DIR }}/*.csv
