@@ -1,0 +1,13 @@
+env:
+  GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+steps:
+  - name: Escribir credenciales
+    run: |
+      echo "$GOOGLE_CREDS" > /tmp/google-creds.json
+  - name: Instalar dependencias
+    run: pip install gspread oauth2client
+  - name: Ejecutar scraper
+    run: python canasta_scraper.py
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-creds.json
+      SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
