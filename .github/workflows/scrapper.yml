@@ -1,40 +1,36 @@
-name: Scraper Canasta
+name: Daily Price Scraper
 
 on:
   schedule:
-    - cron:  '30 10 * * 1-6'   # lunes–sábado 07:30 Asunción (10:30 UTC)
-  workflow_dispatch:
+    - cron: '0 0 * * *'  # Ejecutar diariamente a medianoche UTC
+  workflow_dispatch:       # Permitir ejecución manual
 
 jobs:
-  run-scraper:
+  scrape:
     runs-on: ubuntu-latest
+    env:
+      OUT_DIR: ./csvs
+      SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
+      GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+      
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+    - name: Install dependencies
+      run: pip install -r requirements.txt
 
-      - name: Execute scraper
-        # NO pasamos OUT_DIR aquí; el script usará "/tmp/csvs" si no existe
+    - name: Run Scraper
+      run: python canasta_scraper.py
 
-        env:
-          OUT_DIR: /tmp/csvs
-          GOOGLE_CREDS:    ${{ secrets.GOOGLE_CREDS }}
-          SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
-        run: |
-          python canasta_scraper.py
-
-      - name: Upload CSV artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: canasta-csvs
-          path: /tmp/csvs/*.csv
+    - name: Upload CSV artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: price-csvs
+        path: ${{ env.OUT_DIR }}/*.csv
