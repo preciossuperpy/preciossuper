@@ -53,15 +53,16 @@ except json.JSONDecodeError as e:
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ────────────────── 1. Utilidades de texto ─────────────────────
+# ────────────────── 1. Helpers texto ─────────────────────
 
-def strip_accents(t: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", t) if unicodedata.category(c) != "Mn")
+_defpat = re.compile(r"[a-záéíóúñü]+", re.I)
 
-_token_re = re.compile(r"[a-záéíóúñü]+", re.I)
+def strip_accents(tx):
+    return "".join(ch for ch in unicodedata.normalize("NFD", tx) if unicodedata.category(ch) != "Mn")
 
-def tokenize(txt: str) -> List[str]:
-    return [strip_accents(t.lower()) for t in _token_re.findall(txt)]
+def tokenize(tx):
+    return [strip_accents(t.lower()) for t in _defpat.findall(tx)]
+
 
 # ────────────────── 2. Exclusión y categorización ─────────────────────
 EXCLUDE_PRODUCT_WORDS = [
@@ -212,38 +213,48 @@ def assign_category(name: str) -> Tuple[Optional[str], str]:
             
     return None, ""
 
-# ────────────────── 3. Utilidades de scraping ─────────────────────
+# ────────────────── 3. Scraping utils ─────────────────────
 
-def norm_price(val) -> float:
-    s = re.sub(r"[^\d,\.]", "", str(val)).replace(".", "").replace(",", ".")
+def norm_price(val):
+    raw = str(val)
+    raw = re.sub(r"[^\d,\.]", "", raw).replace(".", "").replace(",", ".")
     try:
-        return float(s)
+        return float(raw)
     except ValueError:
         return 0.0
 
-_price_sels = [
+_price_selectors = [
+    "[data-price]", "[data-price-final]", "[data-price-amount]",
+    "meta[itemprop='price']",
     "span.price ins span.amount", "span.price > span.amount", "span.amount",
     "span.woocommerce-Price-amount", "bdi", "span.price", "span.price-new",
-    "span.precio", "div.price", "p.price", "[data-price]"
+    "span.precio", "div.price", "p.price"
 ]
 
-def _first_price(node: BeautifulSoup) -> float:
-    # 1) atributo data-price en el contenedor
-    raw = node.get("data-price") or node.get("data-price-final")
-    if raw and norm_price(raw):
-        return norm_price(raw)
-    # 2) selectores
-    for sel in _price_sels:
+
+def _first_price(node: Tag) -> float:
+    # 1) atributos en el nodo y sus descendientes
+    for attr in ("data-price", "data-price-final", "data-price-amount"):
+        if node.has_attr(attr) and norm_price(node[attr]):
+            return norm_price(node[attr])
+        for el in node.select(f"[{attr}]"):
+            if norm_price(el[attr]):
+                return norm_price(el[attr])
+    # 2) meta price
+    meta = node.select_one("meta[itemprop='price']")
+    if meta and meta.get("content") and norm_price(meta["content"]):
+        return norm_price(meta["content"])
+    # 3) clásicos
+    for sel in _price_selectors[3:]:
         el = node.select_one(sel)
         if el:
-            raw2 = el.get_text() or el.get("data-price", "")
-            p = norm_price(raw2)
+            val = el.get_text() or el.get("content", "")
+            p = norm_price(val)
             if p:
                 return p
     return 0.0
 
-
-def _build_session():
+def _session():
     retry = Retry(total=3, backoff_factor=1.2, status_forcelist=(429,500,502,503,504), allowed_methods=("GET","HEAD"))
     s = requests.Session()
     s.headers["User-Agent"] = "Mozilla/5.0"
@@ -251,44 +262,46 @@ def _build_session():
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
-# ────────────────── 4. Clase base ─────────────────────
-class HtmlSiteScraper:
-    def __init__(self, name: str, base: str):
-        self.name = name
-        self.base_url = base.rstrip("/")
-        self.session = _build_session()
-    def category_urls(self) -> List[str]:
-        raise NotImplementedError
-    def parse_category(self, url: str) -> List[Dict]:
-        raise NotImplementedError
 
-    def scrape(self) -> List[Dict]:
+
+# ────────────────── 4. Base scraper ─────────────────────
+class HtmlSiteScraper:
+    def __init__(self, name, base):
+        self.name = name
+        self.base_url = base.rstrip("/") if base else ""
+        self.session = _session()
+    def category_urls(self):
+        raise NotImplementedError
+    def parse_category(self, url):
+        raise NotImplementedError
+    def scrape(self):
         urls = self.category_urls()
-        fecha = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")  # UTC ISO
-        rows: List[Dict] = []
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
         with ThreadPoolExecutor(MAX_WORKERS) as pool:
-            futures = [pool.submit(self.parse_category, u) for u in urls]
-            for fut in as_completed(futures):
+            futs = [pool.submit(self.parse_category, u) for u in urls]
+            for fut in as_completed(futs):
                 for r in fut.result():
-                    r["FechaConsulta"] = fecha
+                    r["FechaConsulta"] = ts
+                    # Filas con precio 0 se descartan (fuente fallida)
+                    if r.get("Precio", 0) == 0:
+                        continue
                     rows.append({c: r.get(c, "" if c != "Precio" else 0.0) for c in COLUMNS})
         return rows
-
     def save_csv(self, rows):
         if rows:
             fn = f"{self.name}_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
             pd.DataFrame(rows)[COLUMNS].to_csv(os.path.join(OUT_DIR, fn), index=False)
-
+           
 # ────────────────── 5. Scrapers específicos ─────────────────────
 
 class StockScraper(HtmlSiteScraper):
     def __init__(self):
         super().__init__("Stock", "https://www.stock.com.py")
     def category_urls(self):
-        html = self.session.get(self.base_url, timeout=REQ_TIMEOUT).text
-        soup = BeautifulSoup(html, "html.parser")
-        pats = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
-        return [urljoin(self.base_url, a["href"]) for a in soup.select('a[href*="/category/"]') if any(k in a["href"].lower() for k in pats)]
+        soup = BeautifulSoup(self.session.get(self.base_url, timeout=REQ_TIMEOUT).text, "html.parser")
+        kw = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
+        return [urljoin(self.base_url, a["href"]) for a in soup.select('a[href*="/category/"]') if any(k in a["href"].lower() for k in kw)]
     def parse_category(self, url):
         soup = BeautifulSoup(self.session.get(url, timeout=REQ_TIMEOUT).content, "html.parser")
         rows = []
@@ -298,6 +311,7 @@ class StockScraper(HtmlSiteScraper):
             name = name_el.get_text(" ", strip=True)
             if is_excluded(name): continue
             price = _first_price(card)
+            if price == 0: continue
             cat, sub = assign_category(name)
             if not cat: continue
             rows.append({"Supermercado": "Stock", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
@@ -308,16 +322,17 @@ class SuperseisScraper(HtmlSiteScraper):
         super().__init__("Superseis", "https://www.superseis.com.py")
     def category_urls(self):
         soup = BeautifulSoup(self.session.get(self.base_url, timeout=REQ_TIMEOUT).text, "html.parser")
-        pats = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
-        return [urljoin(self.base_url, a["href"]) for a in soup.select('a.collapsed[href*="/category/"]') if any(k in a["href"].lower() for k in pats)]
+        kw = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
+        return [urljoin(self.base_url, a["href"]) for a in soup.select('a.collapsed[href*="/category/"]') if any(k in a["href"].lower() for k in kw)]
     def parse_category(self, url):
         soup = BeautifulSoup(self.session.get(url, timeout=REQ_TIMEOUT).content, "html.parser")
         rows = []
         for link in soup.select("a.product-title-link"):
             name = link.get_text(" ", strip=True)
             if is_excluded(name): continue
-            card = link.find_parent("div", class_="product-item") or link
-            price = _first_price(card)
+            cont = link.find_parent("div", class_="product-item") or link
+            price = _first_price(cont)
+            if price == 0: continue
             cat, sub = assign_category(name)
             if not cat: continue
             rows.append({"Supermercado": "Superseis", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
@@ -418,6 +433,7 @@ SCRAPERS: Dict[str, Callable] = {
 
 def _sheet_open():
     scopes = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
+    ws = None
     cred = Credentials.from_service_account_file(CREDS_JSON, scopes=scopes)
     gc = gspread.authorize(cred)
     sh = gc.open_by_url(SPREADSHEET_URL)
@@ -427,110 +443,48 @@ def _sheet_open():
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=WORKSHEET_NAME, rows="1000", cols="50")
         df_prev = pd.DataFrame(columns=COLUMNS)
+    # limpiar columna obsoleta
+    if "CategoríaURL" in df_prev.columns:
+        df_prev.drop(columns=["CategoríaURL"], inplace=True)
     return ws, df_prev.reindex(columns=COLUMNS, fill_value="")
 
-def _write_sheet(ws, df):
-    try:
-        # Ordenar columnas según REQUIRED_COLS + otras
-        ordered_cols = [c for c in REQUIRED_COLS if c in df.columns] + \
-                      [c for c in df.columns if c not in REQUIRED_COLS]
-        df = df[ordered_cols]
-        
-        ws.clear()
-        set_with_dataframe(ws, df, include_index=False)
-    except Exception as e:
-        print(f"Error al escribir en Google Sheets: {e}")
-        raise
 
-# ────────────────── 7. Orquestador principal ───────────────────
-def _parse_args(args):
-    if not args or "all" in args:
-        return list(SCRAPERS.keys())
-    return [a for a in args if a in SCRAPERS]
+def _sheet_write(ws, df):
+    ws.clear()
+    set_with_dataframe(ws, df[COLUMNS], include_index=False)
 
-def main(argv=None):
-    objetivos = _parse_args(argv if argv is not None else sys.argv[1:])
-    registros = []
-    
-    print("\n" + "="*50)
-    print(f"Iniciando scraping de {len(objetivos)} supermercados")
-    print("="*50 + "\n")
-    
-    for key in objetivos:
-        try:
-            scraper = SCRAPERS[key]()
-            filas = scraper.scrape()
-            scraper.save_csv(filas)
-            registros.extend(filas)
-            print(f"• {key:<12}: {len(filas):>5} productos válidos")
-        except Exception as e:
-            print(f"Error en {key}: {e}")
-    
-    if not registros:
-        print("\nNo se encontraron datos nuevos. Saliendo...")
-        return 0
+# ────────────────── 8. Orquestador principal ─────────────────────
 
-    # Procesar archivos CSV generados
-    archivos_csv = glob.glob(PATTERN_DAILY)
-    if not archivos_csv:
-        print("\nNo se encontraron archivos CSV. Saliendo...")
-        return 1
-        
-    try:
-        # Leer y combinar todos los CSVs
-        dfs = []
-        for f in archivos_csv:
-            try:
-                df = pd.read_csv(f, dtype=str)
-                # Asegurar columnas requeridas
-                for col in REQUIRED_COLS:
-                    if col not in df.columns:
-                        df[col] = "" if col != "Precio" else "0.0"
-                dfs.append(df)
-                print(f"Leído: {f} ({len(df)} filas)")
-            except Exception as e:
-                print(f"Error leyendo {f}: {e}")
-        
-        df_all = pd.concat(dfs, ignore_index=True, sort=False)
-        
-        # Normalizar datos
-        df_all["Categoría"] = df_all["Categoría"].fillna("")
-        df_all["Subcategoría"] = df_all["Subcategoría"].fillna("")
-        df_all["Precio"] = pd.to_numeric(df_all["Precio"], errors="coerce").fillna(0.0)
-        
-        # Abrir Google Sheets
-        ws, df_prev = _open_sheet()
-        
-        # Combinar con datos históricos
-        base = pd.concat([df_prev, df_all], ignore_index=True, sort=False)
-        
-        # Procesar fechas y eliminar duplicados
-        base["FechaConsulta"] = pd.to_datetime(base["FechaConsulta"], errors="coerce")
-        base.sort_values("FechaConsulta", inplace=True)
-        base["FechaConsulta"] = base["FechaConsulta"].dt.strftime("%Y-%m-%d")
-        
-        # Eliminar duplicados manteniendo la primera aparición
-        base.drop_duplicates(subset=KEY_COLS, keep="first", inplace=True)
-        
-        # Restablecer IDs
-        if "ID" in base.columns:
-            base.drop(columns=["ID"], inplace=True)
-        base.insert(0, "ID", range(1, len(base) + 1))
-        
-        # Escribir en Google Sheets
-        _write_sheet(ws, base)
-        
-        print("\n" + "="*50)
-        print(f"✅ Hoja actualizada exitosamente")
-        print(f"Total de registros: {len(base)}")
-        print(f"Registros nuevos: {len(df_all)}")
-        print("="*50)
-        
-        return 0
-        
-    except Exception as e:
-        print(f"\n❌ Error crítico: {e}")
-        return 1
+def main(args=None):
+    targets = (args or sys.argv[1:]) or list(SCRAPERS)
+    rows: List[Dict] = []
+    for key in targets:
+        scr = SCRAPERS[key]()
+        data = scr.scrape()
+        scr.save_csv(data)
+        rows.extend(data)
+        print(f"• {key:<10}: {len(data):>4} filas válidas")
+    if not rows:
+        print("Sin datos nuevos"); return 0
+
+    dfs = [pd.read_csv(f, dtype=str)[COLUMNS] for f in glob.glob(PATTERN_DAILY)]
+    df_all = pd.concat(dfs, ignore_index=True)
+    df_all["Precio"] = pd.to_numeric(df_all["Precio"], errors="coerce")
+
+    ws, df_prev = _sheet_open()
+    base = pd.concat([df_prev, df_all], ignore_index=True)
+    base["FechaConsulta"] = pd.to_datetime(base["FechaConsulta"], errors="coerce")
+    base.sort_values("FechaConsulta", inplace=True)
+    base["FechaConsulta"] = base["FechaConsulta"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    base.drop_duplicates(KEY_COLS, keep="first", inplace=True)
+    if "ID" in base.columns:
+        base.drop(columns="ID", inplace=True)
+    base.insert(0, "ID", range(1, len(base)+1))
+
+    _sheet_write(ws, base)
+    print(f"✅ Hoja actualizada ({len(base)} registros)")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
+
