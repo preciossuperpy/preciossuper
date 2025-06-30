@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Scraper unificado de precios – GitHub Actions (build 2025-07-01-completo)
+Scraper unificado de precios – GitHub Actions (build 2025-07-02-final)
 Autor: Diego B. Meza
 
 Este script realiza:
-1) Scraping de múltiples supermercados (Stock, Superseis, Salemma, Arete, Jardines, Biggie).
+1) Scraping de múltiples supermercados: Stock, Superseis, Salemma, Arete, Jardines y Biggie.
 2) Clasificación en Grupo/Subgrupo.
 3) Extracción de unidad de medida.
-4) Registro de FechaConsulta con fecha+hora+min+seg (UTC).
+4) Registro de FechaConsulta con fecha+hora+minutos+segundos (UTC).
 5) Consolidación de CSVs y actualización en Google Sheets.
 Columnas finales:
-    ['ID','Supermercado','Producto','Precio','Unidad','Grupo','Subgrupo','FechaConsulta']
+    ['ID', 'Supermercado', 'Producto', 'Precio', 'Unidad', 'Grupo', 'Subgrupo', 'FechaConsulta']
 """
 
 import os, sys, glob, re, json, unicodedata, tempfile
@@ -36,7 +36,8 @@ PATTERN_DAILY   = os.path.join(OUT_DIR, "*_canasta_*.csv")
 WORKSHEET_NAME  = "maestro"
 MAX_WORKERS, REQ_TIMEOUT = 8, 10
 
-# Columnas estándar\COLUMNS = ["Supermercado", "Producto", "Precio", "Unidad", "Grupo", "Subgrupo", "FechaConsulta"]
+# Columnas estándar
+COLUMNS = ["Supermercado", "Producto", "Precio", "Unidad", "Grupo", "Subgrupo", "FechaConsulta"]
 KEY_COLS = ["Supermercado", "Producto", "FechaConsulta"]
 
 # Credenciales de Google
@@ -99,10 +100,10 @@ BROAD_TOKENS = {g: {strip_accents(w) for w in ws} for g, ws in BROAD_GROUP_KEYWO
 SUBGROUP_KEYWORDS = {
     "Naranja": ["naranja","naranjas"],
     "Cebolla": ["cebolla","cebollas"],
-    "Leche Entera": ["leche","entera"],
-    "Leche Descremada": ["leche","descremada"],
-    "Queso Paraguay": ["queso","paraguay"],
-    "Huevo Gallina": ["huevo","gallina"],
+    "Leche Entera": ["entera"],
+    "Leche Descremada": ["descremada"],
+    "Queso Paraguay": ["paraguay"],
+    "Huevo Gallina": ["gallina"],
     "Huevo Codorniz": ["codorniz"],
 }
 SUB_TOKENS = {sg: {strip_accents(w) for w in ws} for sg, ws in SUBGROUP_KEYWORDS.items()}
@@ -126,7 +127,11 @@ def extract_unit(name: str) -> str:
     return f"{val}{unit}"
 
 # ─────────────── 5. Precio helper ───────────────────────────
-_price_sels = ["[data-price]","[data-price-final]","meta[itemprop='price']","span.price","span.amount","bdi"]
+_price_selectors = [
+    "[data-price]", "[data-price-final]", "[data-price-amount]",
+    "meta[itemprop='price']", "span.price ins span.amount", "span.price > span.amount",
+    "span.woocommerce-Price-amount", "span.amount", "bdi", "div.price", "p.price"
+]
 
 def norm_price(val) -> float:
     raw = re.sub(r"[^\d,\.]", "", str(val)).replace(".", "").replace(",", ".")
@@ -140,7 +145,7 @@ def _first_price(node: Tag) -> float:
     meta = node.select_one("meta[itemprop='price']")
     if meta and norm_price(meta.get("content","")):
         return norm_price(meta.get("content"))
-    for sel in _price_sels:
+    for sel in _price_selectors[4:]:
         el = node.select_one(sel)
         if el:
             txt = el.get_text() or el.get(sel, "")
@@ -150,47 +155,54 @@ def _first_price(node: Tag) -> float:
 
 # ─────────────── 6. HTTP session ───────────────────────────
 def _session():
-    retry = Retry(total=3,backoff_factor=1.2,status_forcelist=(429,500,502,503,504),allowed_methods=("GET","HEAD"))
-    s = requests.Session(); s.headers["User-Agent"]="Mozilla/5.0"
-    s.mount("http://",HTTPAdapter(max_retries=retry)); s.mount("https://",HTTPAdapter(max_retries=retry))
+    retry = Retry(total=3, backoff_factor=1.2,
+                  status_forcelist=(429,500,502,503,504),
+                  allowed_methods=("GET","HEAD"))
+    s = requests.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0"
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
 # ─────────────── 7. Clase base de scraper ───────────────────────────
 class HtmlSiteScraper:
-    def __init__(self,name:str,base:str):
-        self.name=name;self.base_url=base.rstrip("/") if base else "";self.session=_session()
-    def category_urls(self)->List[str]: raise NotImplementedError
-    def parse_category(self,url:str)->List[Dict]: raise NotImplementedError
-    def scrape(self)->List[Dict]:
-        ts=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        rows=[]
+    def __init__(self,name: str, base_url: str):
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self.session = _session()
+    def category_urls(self) -> List[str]: raise NotImplementedError
+    def parse_category(self, url: str) -> List[Dict]: raise NotImplementedError
+    def scrape(self) -> List[Dict]:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        rows: List[Dict] = []
         with ThreadPoolExecutor(MAX_WORKERS) as pool:
-            for fut in as_completed([pool.submit(self.parse_category,u) for u in self.category_urls()]):
+            futures = [pool.submit(self.parse_category,u) for u in self.category_urls()]
+            for fut in as_completed(futures):
                 for r in fut.result():
-                    price=r.get("Precio",0)
-                    if price<=0: continue
-                    r["FechaConsulta"]=ts
-                    rows.append({c:r.get(c,"" if c!="Precio" else 0.0) for c in COLUMNS})
+                    price = r.get("Precio",0)
+                    if price <= 0: continue
+                    r["FechaConsulta"] = ts
+                    rows.append({c:r.get(c, "" if c!="Precio" else 0.0) for c in COLUMNS})
         return rows
-    def save_csv(self,rows:List[Dict]):
+    def save_csv(self,rows: List[Dict]):
         if not rows: return
-        fn=f"{self.name}_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
+        fn = f"{self.name}_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
         pd.DataFrame(rows)[COLUMNS].to_csv(os.path.join(OUT_DIR,fn),index=False)
 
 # ─────────────── 8. Stock ───────────────────────────────
 class StockScraper(HtmlSiteScraper):
     def __init__(self): super().__init__("Stock","https://www.stock.com.py")
-    def category_urls(self)->List[str]:
-        soup=BeautifulSoup(self.session.get(self.base_url,timeout=REQU_TIMEOUT).text,"html.parser")
-        kw=[tok for lst in BROAD_GROUP_KEYWORDS.values() for tok in lst]
-        return [urljoin(self.base_url,a["href"]) for a in soup.select('a[href*="/category/"]') if any(k in a["href"].lower() for k in kw)]
-    def parse_category(self,url)->List[Dict]:
-        soup=BeautifulSoup(self.session.get(url,timeout=REQU_TIMEOUT).content,"html.parser")
+    def category_urls(self) -> List[str]:
+        soup = BeautifulSoup(self.session.get(self.base_url,timeout=REQ_TIMEOUT).text,"html.parser")
+        kws = [tok for lst in BROAD_GROUP_KEYWORDS.values() for tok in lst]
+        return [urljoin(self.base_url,a["href"]) for a in soup.select('a[href*="/category/"]') if any(k in a["href"].lower() for k in kws)]
+    def parse_category(self,url: str) -> List[Dict]:
+        soup = BeautifulSoup(self.session.get(url,timeout=REQ_TIMEOUT).content,"html.parser")
         out=[]
         for card in soup.select("div.product-item"):
-            el=card.select_one("h2.product-title")
-            if not el: continue
-            nm=el.get_text(" ",strip=True)
+            title=card.select_one("h2.product-title")
+            if not title: continue
+            nm=title.get_text(" ",strip=True)
             if is_excluded(nm): continue
             price=_first_price(card)
             grp,sub=classify(nm)
@@ -202,12 +214,12 @@ class StockScraper(HtmlSiteScraper):
 # ─────────────── 9. Superseis ───────────────────────────────
 class SuperseisScraper(HtmlSiteScraper):
     def __init__(self): super().__init__("Superseis","https://www.superseis.com.py")
-    def category_urls(self)->List[str]:
+    def category_urls(self) -> List[str]:
         soup=BeautifulSoup(self.session.get(self.base_url,timeout=REQ_TIMEOUT).text,"html.parser")
-        kw=[tok for lst in BROAD_GROUP_KEYWORDS.values() for tok in lst]
-        return [urljoin(self.base_url,a["href"]) for a in soup.select('a.collapsed[href*="/category/"]') if any(k in a["href"].lower() for k in kw)]
-    def parse_category(self,url)->List[Dict]:
-        soup=BeautifulSoup(self.session.get(url,timeout=REQU_TIMEOUT).content,"html.parser")
+        kws=[tok for lst in BROAD_GROUP_KEYWORDS.values() for tok in lst]
+        return [urljoin(self.base_url,a["href"]) for a in Soup.select('a.collapsed[href*="/category/"]') if any(k in a["href"].lower() for k in kws)]
+    def parse_category(self,url):
+        soup=BeautifulSoup(self.session.get(url,timeout=REQ_TIMEOUT).content,"html.parser")
         out=[]
         for link in soup.select("a.product-title-link"):
             nm=link.get_text(" ",strip=True)
@@ -319,7 +331,7 @@ SCRAPERS: Dict[str, Callable] = {
     "biggie": BiggieScraper,
 }
 
-# ─────────────── 15. Google Sheets ───────────────────────────
+# ─────────────── Funciones Google Sheets y Orquestador ─────────────────
 def _open_sheet():
     scopes=["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/spreadsheets"]
     cred=Credentials.from_service_account_file(CREDS_JSON,scopes=scopes)
@@ -329,17 +341,14 @@ def _open_sheet():
         ws=sh.worksheet(WORKSHEET_NAME)
         df_prev=get_as_dataframe(ws,dtype=str,header=0,evaluate_formulas=False).dropna(how="all")
     except gspread.exceptions.WorksheetNotFound:
-        ws=sh.add_worksheet(title=WORKSHEET_NAME,rows="2000",cols="50")
+        ws=sh.add_worksheet(title=WORKSHEET_NAME,rows="1000",cols="20")
         df_prev=pd.DataFrame(columns=COLUMNS)
-    if "CategoríaURL" in df_prev.columns:
-        df_prev.drop(columns=["CategoríaURL"],inplace=True)
     return ws,df_prev
 
 def _write_sheet(ws,df:pd.DataFrame):
     ws.clear()
     set_with_dataframe(ws,df[COLUMNS],include_index=False)
 
-# ─────────────── 16. Orquestador ───────────────────────────
 def main():
     all_rows=[]
     for key,cls in SCRAPERS.items():
@@ -347,7 +356,6 @@ def main():
         recs=inst.scrape()
         inst.save_csv(recs)
         all_rows.extend(recs)
-        print(f"• {key}: {len(recs)} productos")
     if not all_rows:
         print("Sin datos nuevos.")
         return
