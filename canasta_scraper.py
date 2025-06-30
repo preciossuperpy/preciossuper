@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-Scraper unificado de precios – versión GitHub Actions (bugs fix 2025‑07‑01)
+Scraper unificado de precios – versión GitHub Actions (2025‑07‑02)
 Autor: Diego B. Meza
 
-Cambios respecto a la versión anterior
-──────────────────────────────────────
-1. **FechaConsulta** ahora se conserva con fecha + hora (formato ISO) y ya no se
-   trunca al sólo día.
-2. Se **elimina** completamente la columna *CategoríaURL* (no se almacena en CSV
-   ni en la hoja).
-3. Mejoras de detección de precio para **Stock** y **Superseis**:
-   • Se añade lectura del atributo `data-price` y más selectores.
-4. Se asegura que *todas* las filas tengan exactamente las columnas estándar
-   `['Supermercado','Producto','Precio','Categoría','Subcategoría','FechaConsulta']`.
+Correcciones sobre la versión anterior:
+1. FechaConsulta incluye fecha+hora+minuto+segundo en UTC (ISO).
+2. Se elimina la columna CategoríaURL en CSV y Sheets.
+3. Todas las filas usan columnas estándar:
+   ['ID','Supermercado','Producto','Precio','Unidad','Categoría','Subcategoría','FechaConsulta']
+4. Detección de precio mejorada para Stock y Superseis.
 """
-
-import os, sys, glob, re, json, unicodedata, tempfile
-from datetime import datetime
+import os
+import sys
+import glob
+import re
+import json
+import unicodedata
+import tempfile
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
-from typing import List, Dict, Callable, Set, Tuple
+from typing import List, Dict, Set, Tuple
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import gspread
@@ -34,38 +35,34 @@ from google.oauth2.service_account import Credentials
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 CREDS_RAW       = os.getenv("GOOGLE_CREDS")
 OUT_DIR         = os.getenv("OUT_DIR", "./csvs")
-PATTERN_DAILY   = os.path.join(OUT_DIR, "*_canasta_*.csv")
-WORKSHEET_NAME  = "maestro"
+PATTERN_DAILY   = os.path.join(OUT_DIR, "*canasta_*.csv")
+WORKSHEET_NAME  = os.getenv("WORKSHEET_NAME", "maestro")
 MAX_WORKERS, REQ_TIMEOUT = 8, 10
 
-# Esquema estándar
-COLUMNS = ["Supermercado", "Producto", "Precio", "Categoría", "Subcategoría", "FechaConsulta"]
-KEY_COLS = ["Supermercado", "Producto", "FechaConsulta"]
+# Columnas y claves
+COLUMNS = ["ID","Supermercado","Producto","Precio","Unidad","Categoría","Subcategoría","FechaConsulta"]
+KEY_COLS = ["Supermercado","Producto","FechaConsulta"]
 
+# Validar credenciales Google
 if not CREDS_RAW:
-    raise ValueError("La variable de entorno GOOGLE_CREDS está vacía")
-try:
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(json.loads(CREDS_RAW), f)
-        CREDS_JSON = f.name
-except json.JSONDecodeError as e:
-    sys.exit(f"GOOGLE_CREDS no es JSON válido: {e}")
-
+    raise ValueError("GOOGLE_CREDS no proporcionado")
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+    json.dump(json.loads(CREDS_RAW), f)
+    CREDS_JSON = f.name
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ────────────────── 1. Helpers texto ─────────────────────
+# ────────────────── 1. Utilidades de texto ─────────────────────
+_token_re = re.compile(r"[a-záéíóúñü]+", re.I)
 
-_defpat = re.compile(r"[a-záéíóúñü]+", re.I)
+def strip_accents(txt: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", txt)
+                   if unicodedata.category(c) != "Mn")
 
-def strip_accents(tx):
-    return "".join(ch for ch in unicodedata.normalize("NFD", tx) if unicodedata.category(ch) != "Mn")
+def tokenize(txt: str) -> List[str]:
+    return [strip_accents(t.lower()) for t in _token_re.findall(txt)]
 
-def tokenize(tx):
-    return [strip_accents(t.lower()) for t in _defpat.findall(tx)]
-
-
-# ────────────────── 2. Exclusión y categorización ─────────────────────
-EXCLUDE_PRODUCT_WORDS = [
+# ────────────────── 2. Exclusión productos ─────────────────────
+EXCLUDE_WORDS = [
     "medicamento", "medicina", "pastilla", "comprimido", "cápsula", "jarabe", "supositorio", "inyección",
     "antibiótico", "analgésico", "antiinflamatorio", "antihistamínico", "antidepresivo", "vitamina", "suplemento",
     "prescripción", "receta", "farmacia", "droguería", "fármaco", "genérico", "marca", "aspirina", "diclofenac",
@@ -83,407 +80,286 @@ EXCLUDE_PRODUCT_WORDS = [
     "copa menstrual", "bolsa térmica", "tinte", "coloración", "alisador", "rizador", "secador", "plancha", "tenacilla",
     "celulitis", "corporal", "estrias", "aciclovir", "fusifar", "dental", "facial", "loción", "corporal"
 ]
-EXCLUDE_SET: Set[str] = {strip_accents(w) for w in EXCLUDE_PRODUCT_WORDS}
+
+EXCLUDE_SET: Set[str] = {strip_accents(w) for w in EXCLUDE_WORDS}
 
 def is_excluded(name: str) -> bool:
-    if not name:
-        return False
-    tokens = set(tokenize(name))
-    if tokens & EXCLUDE_SET:
-        return True
-    name_lower = name.lower()
-    exclusion_patterns = [
-        r"\b(crema|gel|loción)\s+(para|de)\s+",
-        r"\b(jabón|shampoo)\b",
-        r"\bvitamina\b",
-        r"\b(medicamento|medicina)\b",
-        r"\b(anti\w+|desinfectante)\b"
-    ]
-    return any(re.search(pat, name_lower) for pat in exclusion_patterns)
+    if not name: return False
+    toks = set(tokenize(name))
+    if toks & EXCLUDE_SET: return True
+    return False
 
-CATEGORY_RULES = [
-    {
-        "name": "Carnes",
-        "include": [
-            r"\bcarne\b", r"\bvacuno\b", r"\bcerdo\b", r"\bpollo\b", r"\bpescado\b",
-            r"\bmarisco\b", r"\bhamburguesa\b", r"\bmortadela\b", r"\bchuleta\b", r"\bpechuga\b",
-            r"\bmuslo\b", r"\bmilanesa\b", r"\bsalchicha\b", r"\bchorizo\b", r"\bchurrasco\b",
-            r"\bbife\b", r"\blomo\b", r"\basado\b", r"\bnalga\b", r"\bcuadril\b",
-            r"\bcarne molida\b", r"\bpicada\b", r"\bpeceto\b"
-        ],
-        "exclude": [
-            r"\bconserva\b", r"\blata\b", r"\benlatado\b", r"\bsalsa\b"
-        ],
-        "subcategories": [
-            {"name": "Pollo", "include": [r"\bpollo\b", r"\bpechuga\b", r"\bmuslo\b"]},
-            {"name": "Vacuno", "include": [r"\bvacuno\b", r"\bbife\b", r"\blomo\b"]},
-            {"name": "Cerdo", "include": [r"\bcerdo\b", r"\bchuleta\b", r"\bbondiola\b"]},
-            {"name": "Pescado", "include": [r"\bpescado\b", r"\bmerluza\b", r"\bsurubí\b"]},
-            {"name": "Fiambres", "include": [r"\bmortadela\b", r"\bsalchicha\b", r"\bjamón\b"]},
-            {"name": "Otros", "include": []}  # Subcategoría por defecto
-        ]
-    },
-    {
-        "name": "Panadería",
-        "include": [
-            r"\bpan\b", r"\bbaguette\b", r"\bfactura\b", r"\bmedialuna\b", r"\bcroissant\b",
-            r"\bbizcocho\b", r"\bbudin\b", r"\btorta\b", r"\bgalleta\b", r"\bpizza\b",
-            r"\bchipa\b", r"\btostada\b", r"\broquilla\b", r"\bpanettone\b"
-        ],
-        "exclude": [r"\bmolde\b", r"\bjuguete\b"],
-        "subcategories": [
-            {"name": "Pan", "include": [r"\bpan integral\b", r"\bpan de molde\b"]},
-            {"name": "Facturas", "include": [r"\bfactura\b", r"\bmedialuna\b", r"\bcroissant\b"]},
-            {"name": "Pizzas", "include": [r"\bpizza\b"]},
-            {"name": "Postres", "include": [r"\bbizcocho\b", r"\btorta\b"]},
-            {"name": "Otros", "include": []}  # Subcategoría por defecto
-        ]
-    },
-    {
-        "name": "Huevos",
-        "include": [r"\bhuevo\b", r"\bhuevos\b"],
-        "exclude": [r"\bpascua\b", r"\bdecorado\b"],
-        "require_exact": True,
-        "subcategories": [
-            {"name": "Blanco", "include": [r"\bhuevo blanco\b"]},
-            {"name": "Color", "include": [r"\bhuevo marrón\b"]},
-            {"name": "Codorniz", "include": [r"\bhuevo de codorniz\b"]},
-            {"name": "Otros", "include": []}  # Subcategoría por defecto
-        ]
-    },
-    {
-        "name": "Lácteos",
-        "include": [
-            r"\bleche\b", r"\byogur\b", r"\bqueso\b", r"\bmanteca\b",
-            r"\bcrema\b", r"\bpostre\b", r"\bflan\b", r"\bdulce de leche\b"
-        ],
-        "exclude": [r"\bfacial\b", r"\bshampoo\b"],
-        "subcategories": [
-            {"name": "Leche", "include": [r"\bleche entera\b", r"\bleche descremada\b"]},
-            {"name": "Quesos", "include": [r"\bqueso\b"]},
-            {"name": "Yogures", "include": [r"\byogur\b"]},
-            {"name": "Cremas", "include": [r"\bcrema de leche\b"]},
-            {"name": "Dulces", "include": [r"\bdulce de leche\b"]},
-            {"name": "Otros", "include": []}  # Subcategoría por defecto
-        ]
-    },
-    {
-        "name": "Verdulería",
-        "include": [
-            r"\blechuga\b", r"\btomate\b", r"\bcebolla\b", r"\bzanahoria\b",
-            r"\bpapa\b", r"\bbatata\b", r"\blimón\b", r"\bnaranja\b"
-        ],
-        "exclude": [r"\bconserva\b", r"\benlatado\b"],
-        "subcategories": [
-            {"name": "Hortalizas", "include": [r"\btomate\b", r"\bzapallo\b"]},
-            {"name": "Frutas", "include": [r"\bmanzana\b", r"\bbanana\b"]},
-            {"name": "Tubérculos", "include": [r"\bpapa\b", r"\bbatata\b"]},
-            {"name": "Otros", "include": []}  # Subcategoría por defecto
-        ]
-    }
+# ────────────────── 3. Clasificación Grupo/Subgrupo ─────────────────────
+BROAD_GROUP = {
+    "Panificados":    ["pan","baguette","bizcocho","galleta","masa"],
+    "Frutas":         ["naranja","manzana","banana","pera","uva","frutilla"],
+    "Verduras":       ["tomate","cebolla","papa","zanahoria","lechuga","espinaca"],
+    "Huevos":         ["huevo","huevos","codorniz"],
+    "Lácteos":        ["leche","yogur","queso","manteca","crema"],
+}
+BROAD_TOK = {g:{strip_accents(w) for w in ws} for g,ws in BROAD_GROUP.items()}
+
+SUB_GROUP = {
+    "Naranja":        ["naranja","naranjas"],
+    "Cebolla":        ["cebolla","cebollas"],
+    "Leche Entera":   ["entera"],
+    "Leche Descremada":["descremada"],
+    "Queso Paraguay": ["paraguay"],
+    "Huevo Gallina":  ["gallina"],
+    "Huevo Codorniz": ["codorniz"],
+}
+SUB_TOK = {sg:{strip_accents(w) for w in ws} for sg,ws in SUB_GROUP.items()}
+
+def classify(name: str) -> Tuple[str,str]:
+    toks = set(tokenize(name))
+    grp = next((g for g,ks in BROAD_TOK.items() if toks & ks), "")
+    sub = next((s for s,ks in SUB_TOK.items() if toks & ks), "")
+    return grp, sub
+
+# ────────────────── 4. Extracción Unidad ─────────────────────
+_unit_re = re.compile(r"(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>kg|g|ml|l|lt|u|paq)", re.I)
+
+def extract_unit(name: str) -> str:
+    m = _unit_re.search(name)
+    if not m: return ""
+    val = float(m.group('val').replace(',','.'))
+    unit = m.group('unit').lower()
+    if unit in ('kg',): val*=1000; unit_out='GR'
+    elif unit in ('l','lt'): val*=1000; unit_out='CC'
+    elif unit=='g': unit_out='GR'
+    elif unit=='ml': unit_out='CC'
+    else: unit_out=unit.upper()
+    val_str = str(int(val)) if val.is_integer() else f"{val:.2f}".rstrip('0').rstrip('.')
+    return f"{val_str}{unit_out}"
+
+# ────────────────── 5. Precio ─────────────────────
+_price_sel = [
+    "[data-price]","[data-price-final]","[data-price-amount]",
+    "meta[itemprop='price']","span.price ins span.amount","span.price > span.amount",
+    "span.woocommerce-Price-amount","span.amount","bdi","div.price","p.price"
 ]
 
-def assign_category(name: str) -> Tuple[Optional[str], str]:
-    if not name:
-        return None, ""
-    
-    # Normalizar nombre para comparaciones
-    normalized_name = strip_accents(name.lower())
-    
-    for cat in CATEGORY_RULES:
-        # Aplicar exclusiones primero
-        if any(re.search(excl, normalized_name) for excl in cat.get("exclude", [])):
-            continue
-            
-        # Verificar coincidencias
-        if any(re.search(pat, normalized_name) for pat in cat.get("include", [])):
-            main_cat = cat["name"]
-            sub_cat = "Otros"  # Valor por defecto
-            
-            # Buscar subcategoría específica
-            for sub in cat.get("subcategories", []):
-                if sub["name"] == "Otros":  # Saltar la categoría "Otros"
-                    continue
-                    
-                if any(re.search(pat, normalized_name) for pat in sub.get("include", [])):
-                    sub_cat = sub["name"]
-                    break
-                    
-            return main_cat, sub_cat
-            
-    return None, ""
+def norm_price(val) -> float:
+    txt = re.sub(r"[^\d,\.]", "", str(val)).replace('.', '').replace(',', '.')
+    try: return float(txt)
+    except: return 0.0
 
-# ────────────────── 3. Scraping utils ─────────────────────
-
-def norm_price(val):
-    raw = str(val)
-    raw = re.sub(r"[^\d,\.]", "", raw).replace(".", "").replace(",", ".")
-    try:
-        return float(raw)
-    except ValueError:
-        return 0.0
-
-_price_selectors = [
-    "[data-price]", "[data-price-final]", "[data-price-amount]",
-    "meta[itemprop='price']",
-    "span.price ins span.amount", "span.price > span.amount", "span.amount",
-    "span.woocommerce-Price-amount", "bdi", "span.price", "span.price-new",
-    "span.precio", "div.price", "p.price"
-]
-
+from bs4.element import Tag
 
 def _first_price(node: Tag) -> float:
-    # 1) atributos en el nodo y sus descendientes
-    for attr in ("data-price", "data-price-final", "data-price-amount"):
-        if node.has_attr(attr) and norm_price(node[attr]):
+    for attr in ("data-price","data-price-final","data-price-amount"):
+        if node.has_attr(attr) and norm_price(node[attr])>0:
             return norm_price(node[attr])
-        for el in node.select(f"[{attr}]"):
-            if norm_price(el[attr]):
-                return norm_price(el[attr])
-    # 2) meta price
     meta = node.select_one("meta[itemprop='price']")
-    if meta and meta.get("content") and norm_price(meta["content"]):
-        return norm_price(meta["content"])
-    # 3) clásicos
-    for sel in _price_selectors[3:]:
+    if meta and norm_price(meta.get('content',''))>0:
+        return norm_price(meta['content'])
+    for sel in _price_sel:
         el = node.select_one(sel)
         if el:
-            val = el.get_text() or el.get("content", "")
-            p = norm_price(val)
-            if p:
-                return p
+            p = norm_price(el.get_text() or el.get(el.name,''))
+            if p>0: return p
     return 0.0
 
-def _session():
+# ────────────────── 6. HTTP Session ─────────────────────
+def _session() -> requests.Session:
     retry = Retry(total=3, backoff_factor=1.2, status_forcelist=(429,500,502,503,504), allowed_methods=("GET","HEAD"))
     s = requests.Session()
-    s.headers["User-Agent"] = "Mozilla/5.0"
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers['User-Agent']='Mozilla/5.0'
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount('http://',adapter); s.mount('https://',adapter)
     return s
 
-
-
-# ────────────────── 4. Base scraper ─────────────────────
+# ────────────────── 7. Base Scraper ─────────────────────
 class HtmlSiteScraper:
-    def __init__(self, name, base):
-        self.name = name
-        self.base_url = base.rstrip("/") if base else ""
-        self.session = _session()
-    def category_urls(self):
-        raise NotImplementedError
-    def parse_category(self, url):
-        raise NotImplementedError
-    def scrape(self):
-        urls = self.category_urls()
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        rows = []
+    def __init__(self,name:str,base:str):
+        self.name=name; self.base_url=base.rstrip('/'); self.session=_session()
+    def category_urls(self) -> List[str]: raise NotImplementedError
+    def parse_category(self,url:str) -> List[Dict]: raise NotImplementedError
+    def scrape(self) -> List[Dict]:
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        rows=[]
         with ThreadPoolExecutor(MAX_WORKERS) as pool:
-            futs = [pool.submit(self.parse_category, u) for u in urls]
-            for fut in as_completed(futs):
+            for fut in as_completed([pool.submit(self.parse_category,u) for u in self.category_urls()]):
                 for r in fut.result():
-                    r["FechaConsulta"] = ts
-                    # Filas con precio 0 se descartan (fuente fallida)
-                    if r.get("Precio", 0) == 0:
-                        continue
-                    rows.append({c: r.get(c, "" if c != "Precio" else 0.0) for c in COLUMNS})
+                    price=r.get('Precio',0)
+                    if price<=0: continue
+                    r['FechaConsulta']=ts
+                    out={col: r.get(col,'') for col in COLUMNS}
+                    out['Precio']=price
+                    rows.append(out)
         return rows
-    def save_csv(self, rows):
-        if rows:
-            fn = f"{self.name}_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
-            pd.DataFrame(rows)[COLUMNS].to_csv(os.path.join(OUT_DIR, fn), index=False)
-           
-# ────────────────── 5. Scrapers específicos ─────────────────────
+    def save_csv(self,rows:List[Dict]):
+        if not rows: return
+        fn=f"{self.name}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.csv"
+        pd.DataFrame(rows)[COLUMNS].to_csv(os.path.join(OUT_DIR,fn),index=False)
 
+# ────────────────── 8. Scrapers específicos ─────────────────────
 class StockScraper(HtmlSiteScraper):
-    def __init__(self):
-        super().__init__("Stock", "https://www.stock.com.py")
+    def __init__(self): super().__init__('Stock','https://www.stock.com.py')
     def category_urls(self):
-        soup = BeautifulSoup(self.session.get(self.base_url, timeout=REQ_TIMEOUT).text, "html.parser")
-        kw = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
-        return [urljoin(self.base_url, a["href"]) for a in soup.select('a[href*="/category/"]') if any(k in a["href"].lower() for k in kw)]
-    def parse_category(self, url):
-        soup = BeautifulSoup(self.session.get(url, timeout=REQ_TIMEOUT).content, "html.parser")
-        rows = []
-        for card in soup.select("div.product-item"):
-            name_el = card.select_one("h2.product-title")
-            if not name_el: continue
-            name = name_el.get_text(" ", strip=True)
+        soup=BeautifulSoup(self.session.get(self.base_url,timeout=REQ_TIMEOUT).text,'html.parser')
+        kws=[tok for ws in BROAD_GROUP.values() for tok in ws]
+        return [urljoin(self.base_url,a['href']) for a in soup.select('a[href*="/category/"]') if any(k in a['href'].lower() for k in kws)]
+    def parse_category(self,url):
+        soup=BeautifulSoup(self.session.get(url,timeout=REQ_TIMEOUT).content,'html.parser')
+        out=[]
+        for card in soup.select('div.product-item'):
+            nm=card.select_one('h2.product-title');
+            if not nm: continue
+            name=nm.get_text(' ',strip=True)
             if is_excluded(name): continue
-            price = _first_price(card)
-            if price == 0: continue
-            cat, sub = assign_category(name)
-            if not cat: continue
-            rows.append({"Supermercado": "Stock", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
-        return rows
+            price=_first_price(card)
+            grp,sub=classify(name)
+            if not grp: continue
+            unit=extract_unit(name)
+            out.append({'Supermercado':'Stock','Producto':name.upper(),'Precio':price,'Unidad':unit,'Categoría':grp,'Subcategoría':sub})
+        return out
 
 class SuperseisScraper(HtmlSiteScraper):
-    def __init__(self):
-        super().__init__("Superseis", "https://www.superseis.com.py")
+    def __init__(self): super().__init__('Superseis','https://www.superseis.com.py')
     def category_urls(self):
-        soup = BeautifulSoup(self.session.get(self.base_url, timeout=REQ_TIMEOUT).text, "html.parser")
-        kw = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
-        return [urljoin(self.base_url, a["href"]) for a in soup.select('a.collapsed[href*="/category/"]') if any(k in a["href"].lower() for k in kw)]
-    def parse_category(self, url):
-        soup = BeautifulSoup(self.session.get(url, timeout=REQ_TIMEOUT).content, "html.parser")
-        rows = []
-        for link in soup.select("a.product-title-link"):
-            name = link.get_text(" ", strip=True)
-            if is_excluded(name): continue
-            cont = link.find_parent("div", class_="product-item") or link
-            price = _first_price(cont)
-            if price == 0: continue
-            cat, sub = assign_category(name)
-            if not cat: continue
-            rows.append({"Supermercado": "Superseis", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
-        return rows
+        soup=BeautifulSoup(self.session.get(self.base_url,timeout=REQ_TIMEOUT).text,'html.parser')
+        kws=[tok for ws in BROAD_GROUP.values() for tok in ws]
+        return [urljoin(self.base_url,a['href']) for a in soup.select('a.collapsed[href*="/category/"]') if any(k in a['href'].lower() for k in kws)]
+    def parse_category(self,url):
+        soup=BeautifulSoup(self.session.get(url,timeout=REQ_TIMEOUT).content,'html.parser')
+        out=[]
+        for link in soup.select('a.product-title-link'):
+            nm=link.get_text(' ',strip=True)
+            if is_excluded(nm): continue
+            parent=link.find_parent('div.product-item') or link
+            price=_first_price(parent)
+            grp,sub=classify(nm)
+            if not grp: continue
+            unit=extract_unit(nm)
+            out.append({'Supermercado':'Superseis','Producto':nm.upper(),'Precio':price,'Unidad':unit,'Categoría':grp,'Subcategoría':sub})
+        return out
 
 class SalemmaScraper(HtmlSiteScraper):
-    def __init__(self):
-        super().__init__("Salemma", "https://www.salemmaonline.com.py")
+    def __init__(self): super().__init__('Salemma','https://www.salemmaonline.com.py')
     def category_urls(self):
-        soup = BeautifulSoup(self.session.get(self.base_url, timeout=REQ_TIMEOUT).text, "html.parser")
-        pats = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
-        urls = set()
-        for a in soup.find_all("a", href=True):
-            if any(k in a["href"].lower() for k in pats):
-                urls.add(urljoin(self.base_url, a["href"]))
+        soup=BeautifulSoup(self.session.get(self.base_url,timeout=REQ_TIMEOUT).text,'html.parser')
+        kws=[tok for ws in BROAD_GROUP.values() for tok in ws]
+        urls=set()
+        for a in soup.find_all('a',href=True):
+            if any(k in a['href'].lower() for k in kws): urls.add(urljoin(self.base_url,a['href']))
         return list(urls)
-    def parse_category(self, url):
-        soup = BeautifulSoup(self.session.get(url, timeout=REQ_TIMEOUT).content, "html.parser")
-        rows = []
-        for form in soup.select("form.productsListForm"):
-            name = form.find("input", {"name": "name"}).get("value", "")
+    def parse_category(self,url):
+        soup=BeautifulSoup(self.session.get(url,timeout=REQ_TIMEOUT).content,'html.parser')
+        out=[]
+        for frm in soup.select('form.productsListForm'):
+            name=frm.find('input',{'name':'name'}).get('value','')
             if is_excluded(name): continue
-            price = norm_price(form.find("input", {"name": "price"}).get("value", ""))
-            cat, sub = assign_category(name)
-            if not cat: continue
-            rows.append({"Supermercado": "Salemma", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
-        return rows
+            price=norm_price(frm.find('input',{'name':'price'}).get('value',''))
+            grp,sub=classify(name)
+            if not grp: continue
+            unit=extract_unit(name)
+            out.append({'Supermercado':'Salemma','Producto':name.upper(),'Precio':price,'Unidad':unit,'Categoría':grp,'Subcategoría':sub})
+        return out
 
 class AreteScraper(HtmlSiteScraper):
-    def __init__(self):
-        super().__init__("Arete", "https://www.arete.com.py")
+    def __init__(self): super().__init__('Arete','https://www.arete.com.py')
     def category_urls(self):
-        soup = BeautifulSoup(self.session.get(self.base_url, timeout=REQ_TIMEOUT).text, "html.parser")
-        pats = [pat.strip("\\b") for cat in CATEGORY_RULES for pat in cat["include"]]
-        urls = set()
-        for sel in ("#departments-menu", "#menu-departments-menu-1"):
+        soup=BeautifulSoup(self.session.get(self.base_url,timeout=REQ_TIMEOUT).text,'html.parser')
+        kws=[tok for ws in BROAD_GROUP.values() for tok in ws]
+        urls=set()
+        for sel in ('#departments-menu','#menu-departments-menu-1'):
             for a in soup.select(f"{sel} a[href^=\"catalogo/\"]"):
-                if any(k in a["href"].lower() for k in pats):
-                    urls.add(urljoin(self.base_url + "/", a["href"].split("?")[0]))
+                href=a['href'].split('?')[0].lower()
+                if any(k in href for k in kws): urls.add(urljoin(self.base_url+'/',href))
         return list(urls)
-    def parse_category(self, url):
-        soup = BeautifulSoup(self.session.get(url, timeout=REQ_TIMEOUT).content, "html.parser")
-        rows = []
-        for card in soup.select("div.product"):
-            name_el = card.select_one("h2.ecommercepro-loop-product__title")
-            if not name_el: continue
-            name = name_el.get_text(" ", strip=True)
+    def parse_category(self,url):
+        soup=BeautifulSoup(self.session.get(url,timeout=REQ_TIMEOUT).content,'html.parser')
+        out=[]
+        for card in soup.select('div.product'):
+            nm=card.select_one('h2.ecommercepro-loop-product__title')
+            if not nm: continue
+            name=nm.get_text(' ',strip=True)
             if is_excluded(name): continue
-            price = _first_price(card)
-            cat, sub = assign_category(name)
-            if not cat: continue
-            rows.append({"Supermercado": "Arete", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
-        return rows
+            price=_first_price(card)
+            grp,sub=classify(name)
+            if not grp: continue
+            unit=extract_unit(name)
+            out.append({'Supermercado':'Arete','Producto':name.upper(),'Precio':price,'Unidad':unit,'Categoría':grp,'Subcategoría':sub})
+        return out
 
 class JardinesScraper(AreteScraper):
     def __init__(self):
         super().__init__()
-        self.name = "Jardines"
-        self.base_url = "https://losjardinesonline.com.py"
+        self.name='Jardines'
+        self.base_url='https://losjardinesonline.com.py'
 
-# -------- Biggie (API) --------
 class BiggieScraper(HtmlSiteScraper):
-    API = "https://api.app.biggie.com.py/api/articles"
-    TAKE = 100
-    GROUPS = ["carniceria", "panaderia", "huevos", "lacteos"]
-    def __init__(self):
-        super().__init__("Biggie", "")
-        self.session = _build_session()
-    def category_urls(self):
-        return self.GROUPS  # se usan como tokens
-    def parse_category(self, grp):
-        rows = []
-        skip = 0
+    API='https://api.app.biggie.com.py/api/articles'
+    TAKE=100
+    GROUPS=['carniceria','panaderia','huevos','lacteos']
+    def __init__(self): super().__init__('Biggie','')
+    def category_urls(self): return self.GROUPS
+    def parse_category(self,grp):
+        out=[]; skip=0
         while True:
-            js = self.session.get(self.API, params={"take": self.TAKE, "skip": skip, "classificationName": grp}, timeout=REQ_TIMEOUT).json()
-            for it in js.get("items", []):
-                name = it.get("name", "")
+            js=self.session.get(self.API,params={'take':self.TAKE,'skip':skip,'classificationName':grp},timeout=REQ_TIMEOUT).json()
+            for it in js.get('items',[]):
+                name=it.get('name','')
                 if is_excluded(name): continue
-                price = norm_price(it.get("price", 0))
-                cat, sub = assign_category(name)
-                if not cat: continue
-                rows.append({"Supermercado": "Biggie", "Producto": name.upper(), "Precio": price, "Categoría": cat, "Subcategoría": sub})
-            skip += self.TAKE
-            if skip >= js.get("count", 0): break
-        return rows
+                price=norm_price(it.get('price',0))
+                grp2,sub=classify(name)
+                cat=grp2 or grp.capitalize()
+                if price<=0: continue
+                unit=extract_unit(name)
+                out.append({'Supermercado':'Biggie','Producto':name.upper(),'Precio':price,'Unidad':unit,'Categoría':cat,'Subcategoría':sub})
+            skip+=self.TAKE
+            if skip>=js.get('count',0): break
+        return out
 
-# ────────────────── 6. Registro de scrapers ─────────────────────
-SCRAPERS: Dict[str, Callable] = {
-    "stock": StockScraper,
-    "superseis": SuperseisScraper,
-    "salemma": SalemmaScraper,
-    "arete": AreteScraper,
-    "jardines": JardinesScraper,
-    "biggie": BiggieScraper
+SCRAPERS: Dict[str,Callable] = {
+    'stock': StockScraper,
+    'superseis': SuperseisScraper,
+    'salemma': SalemmaScraper,
+    'arete': AreteScraper,
+    'jardines': JardinesScraper,
+    'biggie': BiggieScraper
 }
 
-# ────────────────── 7. Google Sheets ─────────────────────
-
-def _sheet_open():
-    scopes = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
-    ws = None
-    cred = Credentials.from_service_account_file(CREDS_JSON, scopes=scopes)
-    gc = gspread.authorize(cred)
-    sh = gc.open_by_url(SPREADSHEET_URL)
+# ────────────────── 9. Google Sheets ─────────────────────
+def _open_sheet():
+    scopes=["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/spreadsheets"]
+    cred=Credentials.from_service_account_file(CREDS_JSON,scopes=scopes)
+    gc=gspread.authorize(cred)
+    sh=gc.open_by_url(SPREADSHEET_URL)
     try:
-        ws = sh.worksheet(WORKSHEET_NAME)
-        df_prev = get_as_dataframe(ws, dtype=str, header=0, evaluate_formulas=False)
+        ws=sh.worksheet(WORKSHEET_NAME)
+        df=get_as_dataframe(ws,dtype=str,header=0,evaluate_formulas=False).dropna(how='all')
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows="1000", cols="50")
-        df_prev = pd.DataFrame(columns=COLUMNS)
-    # limpiar columna obsoleta
-    if "CategoríaURL" in df_prev.columns:
-        df_prev.drop(columns=["CategoríaURL"], inplace=True)
-    return ws, df_prev.reindex(columns=COLUMNS, fill_value="")
+        ws=sh.add_worksheet(title=WORKSHEET_NAME,rows='10000',cols='20')
+        df=pd.DataFrame(columns=COLUMNS)
+    return ws,df
 
-
-def _sheet_write(ws, df):
+def _write_sheet(ws,df:pd.DataFrame):
     ws.clear()
-    set_with_dataframe(ws, df[COLUMNS], include_index=False)
+    set_with_dataframe(ws,df[COLUMNS],include_index=False)
 
-# ────────────────── 8. Orquestador principal ─────────────────────
+# ────────────────── 10. Orquestador ─────────────────────
+def main():
+    all_rows=[]
+    for key,cls in SCRAPERS.items():
+        inst=cls()
+        recs=inst.scrape()
+        inst.save_csv(recs)
+        all_rows.extend(recs)
+    if not all_rows:
+        print('Sin datos nuevos.'); return
+    df_all=pd.concat([pd.read_csv(f,dtype=str)[COLUMNS] for f in glob.glob(PATTERN_DAILY)],ignore_index=True)
+    df_all['Precio']=pd.to_numeric(df_all['Precio'],errors='coerce').fillna(0.0)
+    ws,df_prev=_open_sheet()
+    base=pd.concat([df_prev,df_all],ignore_index=True)
+    base['FechaConsulta']=pd.to_datetime(base['FechaConsulta'],errors='coerce')
+    base['FechaConsulta']=base['FechaConsulta'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    base.drop_duplicates(subset=KEY_COLS,keep='first',inplace=True)
+    if 'ID' in base.columns: base.drop(columns=['ID'],inplace=True)
+    base.insert(0,'ID',range(1,len(base)+1))
+    _write_sheet(ws,base)
+    print(f'Hoja actualizada: {len(base)} registros')
 
-def main(args=None):
-    targets = (args or sys.argv[1:]) or list(SCRAPERS)
-    rows: List[Dict] = []
-    for key in targets:
-        scr = SCRAPERS[key]()
-        data = scr.scrape()
-        scr.save_csv(data)
-        rows.extend(data)
-        print(f"• {key:<10}: {len(data):>4} filas válidas")
-    if not rows:
-        print("Sin datos nuevos"); return 0
-
-    dfs = [pd.read_csv(f, dtype=str)[COLUMNS] for f in glob.glob(PATTERN_DAILY)]
-    df_all = pd.concat(dfs, ignore_index=True)
-    df_all["Precio"] = pd.to_numeric(df_all["Precio"], errors="coerce")
-
-    ws, df_prev = _sheet_open()
-    base = pd.concat([df_prev, df_all], ignore_index=True)
-    base["FechaConsulta"] = pd.to_datetime(base["FechaConsulta"], errors="coerce")
-    base.sort_values("FechaConsulta", inplace=True)
-    base["FechaConsulta"] = base["FechaConsulta"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    base.drop_duplicates(KEY_COLS, keep="first", inplace=True)
-    if "ID" in base.columns:
-        base.drop(columns="ID", inplace=True)
-    base.insert(0, "ID", range(1, len(base)+1))
-
-    _sheet_write(ws, base)
-    print(f"✅ Hoja actualizada ({len(base)} registros)")
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__=='__main__':
+    main()
