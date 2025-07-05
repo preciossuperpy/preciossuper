@@ -45,7 +45,7 @@ jobs:
         run: mkdir -p ${{ env.OUT_DIR }}
 
       - name: Ejecutar scraper
-        run: python scrapagroprecios.py
+        run: python canasta_scrapper.py
 
       - name: Verificar archivos generados
         run: |
