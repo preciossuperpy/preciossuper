@@ -10,10 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BASE_DIR: ${{ github.workspace }}
-      OUT_DIR: ${{ github.workspace }}/out
-      GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-      SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
-      WORKSHEET_NAME: "precios_supermercados"
+      OUT_DIR: ${{ github.workspace }}/SUPERSCRAP
 
     steps:
       - name: Checkout repo
@@ -22,7 +19,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'  # Usar Python 3.11
+          python-version: '3.11'
 
       - name: Instalar dependencias
         run: |
@@ -34,22 +31,15 @@ jobs:
           pip install --no-cache-dir pandas==2.2.2
           pip install --no-cache-dir -r requirements.txt
 
-      - name: Configurar credenciales Google
-        env:
-          GCP_CREDS: ${{ secrets.GCP_CREDENTIALS_JSON }}
-        run: |
-          echo "$GCP_CREDS" > creds.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$(pwd)/creds.json" >> $GITHUB_ENV
-
       - name: Crear directorio de salida
         run: mkdir -p ${{ env.OUT_DIR }}
 
       - name: Ejecutar scraper
-        run: python canasta_scraper.py
+        run: python acrapsuperV2.py
 
       - name: Verificar archivos generados
         run: |
-          echo "Contenido del directorio out:"
+          echo "Contenido del directorio de salida:"
           ls -la ${{ env.OUT_DIR }}
           echo "Total de archivos CSV:"
           find ${{ env.OUT_DIR }} -name "*.csv" | wc -l
