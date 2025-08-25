@@ -1,248 +1,642 @@
 # -*- coding: utf-8 -*-
 import os
-import glob
-import logging
-from datetime import datetime, timedelta
 import re
+import unicodedata
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple
+from urllib.parse import urljoin
 
 import pandas as pd
-import numpy as np
+import requests
+from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-from sklearn.linear_model import LinearRegression
+import gspread
+from gspread_dataframe import get_as_dataframe  # solo leer, no escribir
+from google.oauth2.service_account import Credentials
 
-# ---------------------------------------------------------------------
-# Configuración de logging (sin prints)
-# ---------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+# ─────────────────── 0. Configuración ────────────────────
+BASE_DIR        = os.environ.get("BASE_DIR", os.getcwd())
+OUT_DIR         = os.environ.get("OUT_DIR", os.path.join(BASE_DIR, "out"))  # reservado
+SPREADSHEET_URL = os.environ.get("SPREADSHEET_URL")
+CREDS_JSON      = os.environ.get("CREDS_JSON_PATH", os.path.abspath("creds.json"))
+WORKSHEET_NAME  = os.environ.get("WORKSHEET_NAME", "precios_supermercados")
+MAX_WORKERS     = 8
+REQ_TIMEOUT     = 20  # segundos
+
+# Esquema base requerido
+REQUIRED_COLUMNS = [
+    'Supermercado','Producto','Precio','Unidad',
+    'Grupo','Subgrupo','ClasificaProducto','FechaConsulta'
+]
+KEY_COLS = ['Supermercado','Producto','FechaConsulta']
+
+# ────────────────── 1. Utilidades de texto ─────────────────────
+def strip_accents(txt: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", txt)
+                   if unicodedata.category(c) != "Mn")
+
+def normalize_text(txt: str) -> str:
+    return strip_accents(str(txt)).lower()
+
+def tokenize(txt: str) -> List[str]:
+    import re as _re
+    return [strip_accents(t.lower()) for t in _re.findall(r"[a-záéíóúñü]+", str(txt), flags=_re.I)]
+
+# ─────────────── 2. Clasificación Grupo/Subgrupo ─────────────────
+BROAD_GROUP_KEYWORDS = {
+    "Panificados": ["pan","baguette","bizcocho","galleta","masa"],
+    "Frutas":      ["naranja","manzana","banana","banano","platano","plátano","pera","uva","frutilla","guineo","mandarina","pomelo","limon","limón","apepu"],
+    "Verduras":    ["tomate","cebolla","papa","patata","zanahoria","lechuga","espinaca","morron","morrón","locote","pimiento","pimenton","pimentón","remolacha","rucula","rúcula","berro"],
+    "Huevos":      ["huevo","huevos","codorniz"],
+    "Lácteos":     ["leche","yogur","queso","manteca","crema"],
+}
+BROAD_TOKENS = {g:{strip_accents(w) for w in ws} for g,ws in BROAD_GROUP_KEYWORDS.items()}
+
+SUBGROUP_KEYWORDS = {
+    "Naranja": ["naranja","naranjas"],
+    "Cebolla": ["cebolla","cebollas"],
+    "Leche Entera": ["entera"],
+    "Leche Descremada": ["descremada"],
+    "Queso Paraguay": ["paraguay"],
+    "Huevo Gallina": ["gallina"],
+    "Huevo Codorniz": ["codorniz"],
+}
+SUB_TOKENS = {sg:{strip_accents(w) for w in ws} for sg,ws in SUBGROUP_KEYWORDS.items()}
+
+def classify_group_subgroup(name: str) -> Tuple[str, str]:
+    toks = set(tokenize(name))
+    grp = next((g for g, ks in BROAD_TOKENS.items() if toks & ks), "")
+    sub = next((s for s, ks in SUB_TOKENS.items() if toks & ks), "")
+    return grp, sub
+
+# ─────────────── 2.1. Clasificación “fresco” ───────────────
+EXCLUSIONES_GENERALES_RE = re.compile(
+    r"\b(extracto|jugo|sabor|pulpa|pure|salsa|lata|en\s+conserva|encurtid[oa]|congelad[oa]|deshidratad[oa]|pate|mermelada|chips|snack|polvo|humo)\b"
 )
-logger = logging.getLogger("ReportGenerator")
+TOMATE_EXC_RE = re.compile(
+    r"(arroz\s+con\s+tomate|en\s+tomate|salsa(\s+de)?\s+tomate|ketchup|tomate\s+en\s+polvo|tomate\s+en\s+lata|extracto|jugo|pulpa|pure|congelad[oa]|deshidratad[oa])"
+)
+CEBOLLA_EXC_RE = re.compile(r"(en\s+polvo|salsa|conserva|encurtid[oa]|congelad[oa]|deshidratad[oa]|pate|crema|sopa)")
+PAPA_EXC_RE    = re.compile(r"(chips|frita|fritas|chuño|pure|congelad[oa]|deshidratad[oa]|harina|sopa|snack)")
+ZANAHORIA_EXC_RE = re.compile(r"(jugo|pure|conserva|congelad[oa]|deshidratad[oa]|salsa|tarta|pastel|mermelada)")
+REMOLACHA_EXC_RE = re.compile(r"(en\s+lata|conserva|encurtid[oa]|congelad[oa]|deshidratad[oa]|jugo|pulpa|mermelada)")
+BANANA_EXC_RE    = re.compile(r"(harina|polvo|chips|frita|dulce|mermelada|batido|jugo|snack|pure|congelad[oa]|deshidratad[oa])")
+CITRICOS_EXC_RE  = re.compile(r"(jugo|mermelada|concentrad[oa]|esencia|sabor|pulpa|congelad[oa]|deshidratad[oa]|dulce|jarabe)")
 
-# ---------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------
-def _slugify_filename(name: str) -> str:
-    """
-    Convierte un nombre arbitrario a un nombre de archivo seguro.
-    """
-    name = name.strip()
-    name = re.sub(r"\s+", "_", name)
-    # quitar cualquier caracter no alfanumérico, guion o subrayado
-    name = re.sub(r"[^a-zA-Z0-9_\-]", "", name)
-    return name[:200] if len(name) > 200 else name
+def clasifica_producto(descripcion: str) -> str:
+    d = normalize_text(descripcion)
+    if not d:
+        return ""
+    if "tomate" in d and not TOMATE_EXC_RE.search(d):
+        return "Tomate fresco"
+    tiene_morron = any(k in d for k in ("morron","locote","pimiento","pimenton"))
+    if tiene_morron and "rojo" in d and not re.search(r"(salsa|mole|pasta|conserva|encurtido|en\s+vinagre|en\s+lata|molid[oa]|deshidratad[oa]|congelad[oa]|pulpa|pate)", d):
+        return "Morrón rojo"
+    if "cebolla" in d and not CEBOLLA_EXC_RE.search(d):
+        return "Cebolla fresca"
+    if ("papa" in d or "patata" in d) and not PAPA_EXC_RE.search(d):
+        return "Papa fresca"
+    if "zanahoria" in d and not ZANAHORIA_EXC_RE.search(d):
+        return "Zanahoria fresca"
+    if "lechuga" in d and not re.search(r"(ensalada\s+procesada|mix\s+de\s+ensaladas|congelad[oa]|deshidratad[oa])", d):
+        return "Lechuga fresca"
+    if "remolacha" in d and not REMOLACHA_EXC_RE.search(d):
+        return "Remolacha fresca"
+    if ("rucula" in d or "arugula" in d) and not EXCLUSIONES_GENERALES_RE.search(d):
+        return "Rúcula fresca"
+    if "berro" in d and not EXCLUSIONES_GENERALES_RE.search(d):
+        return "Berro fresco"
+    if any(k in d for k in ("banana","banano","platano","guineo")) and not BANANA_EXC_RE.search(d):
+        return "Banana fresca"
+    if any(k in d for k in ("naranja","mandarina","pomelo","limon","apepu")) and not CITRICOS_EXC_RE.search(d):
+        return "Cítrico fresco"
+    return ""
 
-def _ensure_docs_placeholder(output_dir: str) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-    index_path = os.path.join(output_dir, "index.html")
-    if not os.path.exists(index_path):
-        with open(index_path, "w", encoding="utf-8") as f:
-            f.write("<!doctype html><meta charset='utf-8'><title>PreciosSuperPY</title>"
-                    "<p>No hay datos disponibles aún.</p>")
+# ─────────────── 2.5. Exclusiones ─────────────────
+EXCLUDE_PATTERNS = [r"\bcombo\b", r"\bpack\b", r"\bdisney\b"]
+_ex_re = re.compile("|".join(EXCLUDE_PATTERNS), re.I)
+def is_excluded(name: str) -> bool:
+    return bool(_ex_re.search(name))
 
-class PriceReportGenerator:
-    def __init__(self, data_dir: str = "SUPERSCRAP", output_dir: str = "docs"):
-        self.data_dir = data_dir
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+# ─────────────── 3. Unidad ─────────────────────────────
+_unit_re = re.compile(
+    r"(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>kg|kilos?|g|gr|ml|cc|l(?:itro)?s?|lt|unid(?:ad)?s?|u|paq|stk)\b",
+    re.I
+)
+def extract_unit(name: str) -> str:
+    m = _unit_re.search(name)
+    if not m:
+        return ""
+    val = float(m.group('val').replace(',', '.'))
+    unit = m.group('unit').lower().rstrip('s')
+    if unit in ('kg', 'kilo'):
+        val *= 1000; unit_out = 'GR'
+    elif unit in ('l', 'lt', 'litro'):
+        val *= 1000; unit_out = 'CC'
+    elif unit in ('g', 'gr'):
+        unit_out = 'GR'
+    elif unit in ('ml', 'cc'):
+        unit_out = 'CC'
+    else:
+        unit_out = unit.upper()
+    val_str = str(int(val)) if val.is_integer() else f"{val:.2f}".rstrip('0').rstrip('.')
+    return f"{val_str}{unit_out}"
 
-    # --------------------------------------------------------------
-    # Carga de datos
-    # --------------------------------------------------------------
-    def load_data(self) -> pd.DataFrame | None:
-        csv_files = glob.glob(os.path.join(self.data_dir, "*.csv"))
-        if not csv_files:
-            logger.warning("No se encontraron archivos CSV en %s", self.data_dir)
-            return None
+# ─────────────── 4. Precio ───────────────────────────
+_price_selectors = [
+    "[data-price]","[data-price-final]","[data-price-amount]",
+    "meta[itemprop='price']","span.price ins span.amount","span.price > span.amount",
+    "span.woocommerce-Price-amount","span.amount","bdi","div.price","p.price"
+]
+def norm_price(val) -> float:
+    txt = re.sub(r"[^\d,\.]", "", str(val)).replace('.', '').replace(',', '.')
+    try:
+        return float(txt)
+    except:
+        return 0.0
 
-        dfs = []
-        for fp in csv_files:
-            try:
-                # Intento robusto de lectura (utf-8 y fallback a latin-1)
+def _first_price(node: Tag) -> float:
+    for attr in ("data-price","data-price-final","data-price-amount"):
+        if node.has_attr(attr) and norm_price(node[attr])>0:
+            return norm_price(node[attr])
+    meta = node.select_one("meta[itemprop='price']")
+    if meta and norm_price(meta.get('content',''))>0:
+        return norm_price(meta.get('content',''))
+    for sel in _price_selectors:
+        el = node.select_one(sel)
+        if el:
+            p = norm_price(el.get_text() or el.get(sel,''))
+            if p>0:
+                return p
+    return 0.0
+
+# ─────────────── 5. HTTP session ───────────────────────────
+def _build_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        backoff_factor=1.5,
+        status_forcelist=(429,500,502,503,504),
+        allowed_methods=("GET","HEAD")
+    )
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "es-ES,es;q=0.9",
+    })
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+# ─────────────── 6. Clase base ───────────────────────────────
+class HtmlSiteScraper:
+    def __init__(self, name: str, base: str):
+        self.name = name
+        self.base_url = base.rstrip('/')
+        self.session = _build_session()
+
+    def category_urls(self) -> List[str]:
+        raise NotImplementedError
+
+    def parse_category(self, url: str) -> List[Dict]:
+        raise NotImplementedError
+
+    def scrape(self) -> List[Dict]:
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        rows: List[Dict] = []
+        urls = self.category_urls()
+        if not urls:
+            return rows
+        with ThreadPoolExecutor(MAX_WORKERS) as pool:
+            for fut in as_completed([pool.submit(self.parse_category, u) for u in urls]):
                 try:
-                    df = pd.read_csv(fp, parse_dates=["FechaConsulta"])
+                    for r in fut.result():
+                        if r.get("Precio", 0) <= 0:
+                            continue
+                        r["FechaConsulta"] = ts
+                        rows.append({
+                            'Supermercado': r['Supermercado'],
+                            'Producto':      r['Producto'],
+                            'Precio':        r['Precio'],
+                            'Unidad':        r['Unidad'],
+                            'Grupo':         r['Grupo'],
+                            'Subgrupo':      r['Subgrupo'],
+                            'ClasificaProducto': r.get('ClasificaProducto', ''),
+                            'FechaConsulta': r['FechaConsulta'],
+                        })
                 except Exception:
-                    df = pd.read_csv(fp, parse_dates=["FechaConsulta"], encoding="latin-1")
-                # Normalización de columnas mínimas requeridas
-                expected = {"FechaConsulta", "Producto", "Supermercado", "Precio"}
-                missing = expected - set(df.columns)
-                if missing:
-                    logger.warning("Archivo %s omitido (faltan columnas: %s)", fp, ", ".join(sorted(missing)))
-                    continue
+                    pass
+        return rows
 
-                # Coerción de Precio a numérico
-                df["Precio"] = pd.to_numeric(df["Precio"], errors="coerce")
-                df = df.dropna(subset=["Precio", "FechaConsulta", "Producto", "Supermercado"])
-                # Filtrar precios no positivos
-                df = df[df["Precio"] > 0]
-                dfs.append(df)
-                logger.info("Cargado %s con %d registros útiles", fp, len(df))
-            except Exception as e:
-                logger.exception("Error cargando %s: %s", fp, e)
+# ─────────────── 7. Scrapers ───────────────────────────────
+class StockScraper(HtmlSiteScraper):
+    def __init__(self):
+        super().__init__('stock', 'https://www.stock.com.py')
 
-        if not dfs:
-            return None
-        return pd.concat(dfs, ignore_index=True)
-
-    # --------------------------------------------------------------
-    # Preparación de datos
-    # --------------------------------------------------------------
-    def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Requiere historial mínimo por producto
-        counts = df["Producto"].value_counts()
-        popular = counts[counts > 5].index
-        df = df[df["Producto"].isin(popular)].copy()
-
-        # Fecha diaria
-        df["Fecha"] = pd.to_datetime(df["FechaConsulta"].dt.date)
-
-        # Precio promedio por fecha, producto y supermercado
-        daily = (
-            df.groupby(["Fecha", "Producto", "Supermercado"], as_index=False)["Precio"]
-              .mean()
-              .sort_values(["Producto", "Supermercado", "Fecha"])
-        )
-        return daily
-
-    # --------------------------------------------------------------
-    # Proyección lineal simple (por producto, no por supermercado)
-    # --------------------------------------------------------------
-    def generate_projection(self, data: pd.DataFrame, product_name: str, days: int = 7):
-        prod = data[data["Producto"] == product_name].copy()
-        if len(prod) < 3:
-            return None
-
-        # Agregar por día para el producto (promedio entre supermercados)
-        per_day = prod.groupby("Fecha", as_index=False)["Precio"].mean().sort_values("Fecha")
-        if per_day["Fecha"].nunique() < 3:
-            return None
-
-        # Regressión lineal sobre ordinal de fecha
-        per_day["FechaOrdinal"] = per_day["Fecha"].map(datetime.toordinal)
-        X = per_day["FechaOrdinal"].to_numpy().reshape(-1, 1)
-        y = per_day["Precio"].to_numpy()
-
-        model = LinearRegression()
-        model.fit(X, y)
-
-        last_date = per_day["Fecha"].max()
-        future_dates = [last_date + timedelta(days=i) for i in range(1, days + 1)]
-        future_ord = np.array([d.toordinal() for d in future_dates]).reshape(-1, 1)
-        future_prices = model.predict(future_ord)
-
-        return list(zip(future_dates, future_prices))
-
-    # --------------------------------------------------------------
-    # Gráfico por producto (líneas por supermercado + proyección)
-    # --------------------------------------------------------------
-    def create_price_evolution_chart(self, data: pd.DataFrame, product_name: str, output_path: str) -> bool:
-        prod = data[data["Producto"] == product_name].copy()
-        if prod.empty:
-            return False
-
-        plt.figure(figsize=(12, 6))
-
-        for market in prod["Supermercado"].dropna().unique():
-            m = prod[prod["Supermercado"] == market]
-            if m.empty:
-                continue
-            plt.plot(m["Fecha"], m["Precio"], marker="o", linewidth=2, label=str(market))
-
-        proj = self.generate_projection(data, product_name)
-        if proj:
-            dates, prices = zip(*proj)
-            plt.plot(dates, prices, linestyle="--", linewidth=2, label="Proyección")
-            # anotaciones
-            for d, p in proj:
-                plt.annotate(f"{p:.0f}", (d, p), textcoords="offset points", xytext=(0, 8), ha="center", fontsize=8)
-
-        plt.title(f"Evolución de Precios: {product_name}")
-        plt.xlabel("Fecha")
-        plt.ylabel("Precio (Gs)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-        plt.gca().yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.0f}"))
-
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        return True
-
-    # --------------------------------------------------------------
-    # HTML (index) con los gráficos Top-N
-    # --------------------------------------------------------------
-    def create_html_report(self, data: pd.DataFrame, top_n: int = 20) -> None:
-        counts = data["Producto"].value_counts()
-        top_products = list(counts.index[:top_n])
-
-        cards = []
-        for prod in top_products:
-            fname = _slugify_filename(prod) + ".png"
-            fpath = os.path.join(self.output_dir, fname)
-            ok = self.create_price_evolution_chart(data, prod, fpath)
-            if ok:
-                cards.append((prod, fname))
-
-        last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        html = [
-            "<!doctype html>",
-            "<html lang='es'><head><meta charset='utf-8'>",
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-            "<title>Reporte de Evolución de Precios</title>",
-            "<style>",
-            "body{font-family:Arial,Helvetica,sans-serif;background:#f5f5f5;margin:0;padding:1rem}",
-            ".wrap{max-width:1100px;margin:0 auto}",
-            ".header{background:#2c3e50;color:#fff;padding:1.25rem 1.5rem;border-radius:10px}",
-            ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-top:16px}",
-            ".card{background:#fff;border-radius:10px;box-shadow:0 2px 6px rgba(0,0,0,.1);padding:12px}",
-            ".title{color:#2c3e50;font-size:18px;margin:0 0 8px}",
-            ".muted{color:#7f8c8d}",
-            "img{max-width:100%;height:auto;border:1px solid #ddd;border-radius:6px}",
-            "</style></head><body><div class='wrap'>",
-            "<div class='header'><h1>Reporte de Evolución de Precios</h1>",
-            "<p class='muted'>Análisis de precios de supermercados con proyecciones</p>",
-            f"<p class='muted'>Última actualización: {last_update}</p>",
-            "</div><div class='grid'>"
+    def category_urls(self) -> List[str]:
+        try:
+            soup = BeautifulSoup(
+                self.session.get(self.base_url, timeout=REQ_TIMEOUT).text,
+                'html.parser'
+            )
+        except Exception:
+            return []
+        kws = [t for lst in BROAD_GROUP_KEYWORDS.values() for t in lst]
+        return [
+            urljoin(self.base_url, a['href'])
+            for a in soup.select('a[href*="/category/"]')
+            if a.has_attr('href') and any(k in a['href'].lower() for k in kws)
         ]
 
-        for prod, fname in cards:
-            html.append("<div class='card'>")
-            html.append(f"<h2 class='title'>{prod}</h2>")
-            html.append(f"<img src='{fname}' alt='Evolución de precios para {prod}'>")
-            html.append("</div>")
+    def parse_category(self, url: str) -> List[Dict]:
+        out: List[Dict] = []
+        try:
+            resp = self.session.get(url, timeout=REQ_TIMEOUT)
+            resp.raise_for_status()
+        except Exception:
+            return out
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        for card in soup.select('div.product-item'):
+            el = card.select_one('h2.product-title')
+            if not el:
+                continue
+            nm = el.get_text(' ', strip=True)
+            if is_excluded(nm):
+                continue
+            price = _first_price(card)
+            grp, sub = classify_group_subgroup(nm)
+            if not grp:
+                continue
+            unit = extract_unit(nm)
+            cp = clasifica_producto(nm)
+            out.append({
+                'Supermercado': 'stock',
+                'Producto':     nm.upper(),
+                'Precio':       price,
+                'Unidad':       unit,
+                'Grupo':        grp,
+                'Subgrupo':     sub,
+                'ClasificaProducto': cp
+            })
+        return out
 
-        html.extend(["</div></div></body></html>"])
-        with open(os.path.join(self.output_dir, "index.html"), "w", encoding="utf-8") as f:
-            f.write("\n".join(html))
-        logger.info("Reporte HTML generado con %d gráficos", len(cards))
+class SuperseisScraper(HtmlSiteScraper):
+    def __init__(self):
+        super().__init__("superseis", "https://www.superseis.com.py")
 
-    # --------------------------------------------------------------
-    # Pipeline completo
-    # --------------------------------------------------------------
-    def generate_report(self) -> bool:
-        _ensure_docs_placeholder(self.output_dir)
-        df = self.load_data()
-        if df is None or df.empty:
-            logger.warning("Sin datos: se mantiene página de marcador de posición.")
-            return False
+    def category_urls(self) -> List[str]:
+        try:
+            r = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        return list({
+            urljoin(self.base_url, a["href"])
+            for a in soup.find_all("a", href=True, class_="collapsed")
+            if "/category/" in a.get("href","")
+        })
 
-        data = self.prepare_data(df)
-        if data is None or data.empty:
-            logger.warning("Datos insuficientes para análisis.")
-            return False
+    def parse_category(self, url: str) -> List[dict]:
+        regs: List[dict] = []
+        try:
+            r = self.session.get(url, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
+        except Exception:
+            return regs
+        soup = BeautifulSoup(r.content, "html.parser")
+        for a in soup.find_all("a", class_="product-title-link"):
+            nombre = a.get_text(strip=True)
+            if is_excluded(nombre):
+                continue
+            cont = a.find_parent("div", class_="product-item")
+            tag = (cont and cont.find("span", class_="price-label")) or a.find_next("span", class_="price-label")
+            precio = norm_price(tag.get_text()) if tag else 0.0
+            if precio <= 0:
+                continue
+            grp, sub = classify_group_subgroup(nombre)
+            if not grp:
+                continue
+            unidad = extract_unit(nombre)
+            cp = clasifica_producto(nombre)
+            regs.append({
+                "Supermercado":   self.name,
+                "Producto":       nombre.upper(),
+                "Precio":         precio,
+                "Unidad":         unidad,
+                "Grupo":          grp,
+                "Subgrupo":       sub,
+                "ClasificaProducto": cp
+            })
+        return regs
 
-        self.create_html_report(data, top_n=20)
-        logger.info("Reporte generado en %s", os.path.abspath(self.output_dir))
-        return True
+class SalemmaScraper(HtmlSiteScraper):
+    def __init__(self):
+        super().__init__('salemma', 'https://www.salemmaonline.com.py')
 
+    def category_urls(self) -> List[str]:
+        urls = set()
+        try:
+            resp = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
+            resp.raise_for_status()
+        except Exception:
+            return []
+        for a in BeautifulSoup(resp.content, 'html.parser').find_all('a', href=True):
+            h = a['href'].lower()
+            if any(tok in h for lst in BROAD_GROUP_KEYWORDS.values() for tok in lst):
+                urls.add(urljoin(self.base_url, h))
+        return list(urls)
+
+    def parse_category(self, url: str) -> List[Dict]:
+        out: List[Dict] = []
+        try:
+            resp = self.session.get(url, timeout=REQ_TIMEOUT)
+            resp.raise_for_status()
+        except Exception:
+            return out
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        for f in soup.select('form.productsListForm'):
+            inp_name = f.find('input', {'name': 'name'})
+            if not inp_name:
+                continue
+            nm = inp_name.get('value', '')
+            if is_excluded(nm):
+                continue
+            price = norm_price((f.find('input', {'name': 'price'}) or {}).get('value', ''))
+            grp, sub = classify_group_subgroup(nm)
+            if not grp:
+                continue
+            unit = extract_unit(nm)
+            cp = clasifica_producto(nm)
+            out.append({
+                'Supermercado': 'salemma',
+                'Producto':     nm.upper(),
+                'Precio':       price,
+                'Unidad':       unit,
+                'Grupo':        grp,
+                'Subgrupo':     sub,
+                'ClasificaProducto': cp
+            })
+        return out
+
+class AreteScraper(HtmlSiteScraper):
+    def __init__(self):
+        super().__init__('arete', 'https://www.arete.com.py')
+
+    def category_urls(self) -> List[str]:
+        urls = set()
+        try:
+            resp = self.session.get(self.base_url, timeout=REQ_TIMEOUT)
+            resp.raise_for_status()
+        except Exception:
+            return []
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        for sel in ('#departments-menu', '#menu-departments-menu-1'):
+            for a in soup.select(f'{sel} a[href^="catalogo/"]'):
+                h = a['href'].split('?')[0].lower()
+                if any(tok in h for lst in BROAD_GROUP_KEYWORDS.values() for tok in lst):
+                    urls.add(urljoin(self.base_url + '/', h))
+        return list(urls)
+
+    def parse_category(self, url: str) -> List[Dict]:
+        out: List[Dict] = []
+        try:
+            resp = self.session.get(url, timeout=REQ_TIMEOUT)
+            resp.raise_for_status()
+        except Exception:
+            return out
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        for card in soup.select('div.product'):
+            el = card.select_one('h2.ecommercepro-loop-product__title')
+            if not el:
+                continue
+            nm = el.get_text(' ', strip=True)
+            if is_excluded(nm):
+                continue
+            price = _first_price(card)
+            grp, sub = classify_group_subgroup(nm)
+            if not grp:
+                continue
+            unit = extract_unit(nm)
+            cp = clasifica_producto(nm)
+            out.append({
+                'Supermercado': 'arete',
+                'Producto':     nm.upper(),
+                'Precio':       price,
+                'Unidad':       unit,
+                'Grupo':        grp,
+                'Subgrupo':     sub,
+                'ClasificaProducto': cp
+            })
+        return out
+
+class JardinesScraper(AreteScraper):
+    def __init__(self):
+        super().__init__()
+        self.name = 'losjardines'
+        self.base_url = 'https://losjardinesonline.com.py'
+
+class BiggieScraper:
+    name = 'biggie'
+    API  = 'https://api.app.biggie.com.py/api/articles'
+    TAKE = 100
+    GROUPS = ['huevos','lacteos','frutas','verduras','cereales','panificados']
+
+    def __init__(self):
+        self.session = _build_session()
+
+    def parse_category(self, grp: str) -> List[Dict]:
+        out: List[Dict] = []
+        skip = 0
+        while True:
+            try:
+                js = self.session.get(
+                    self.API,
+                    params={'take': self.TAKE, 'skip': skip, 'classificationName': grp},
+                    timeout=REQ_TIMEOUT
+                ).json()
+            except Exception:
+                break
+            for it in js.get('items', []):
+                nm = it.get('name', '')
+                price = norm_price(it.get('price', 0))
+                if price <= 0:
+                    continue
+                g, sub = classify_group_subgroup(nm)
+                unit = extract_unit(nm)
+                cp = clasifica_producto(nm)
+                out.append({
+                    'Supermercado': 'biggie',
+                    'Producto':     nm.upper(),
+                    'Precio':       price,
+                    'Unidad':       unit,
+                    'Grupo':        g or grp.capitalize(),
+                    'Subgrupo':     sub,
+                    'ClasificaProducto': cp
+                })
+            skip += self.TAKE
+            if skip >= js.get('count', 0):
+                break
+        return out
+
+    def scrape(self) -> List[Dict]:
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        rows: List[Dict] = []
+        for grp in self.GROUPS:
+            for r in self.parse_category(grp):
+                r['FechaConsulta'] = ts
+                rows.append(r)
+        return rows
+
+# Registro de scrapers
+SCRAPERS = {
+    'stock':       StockScraper,
+    'superseis':   SuperseisScraper,
+    'salemma':     SalemmaScraper,
+    'arete':       AreteScraper,
+    'losjardines': JardinesScraper,
+    'biggie':      BiggieScraper,
+}
+
+# ─────────────── 13. Google Sheets (partición mensual, sin resize masivo) ─────────────────
+def _authorize_sheet():
+    scopes = [
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/spreadsheets',
+    ]
+    cred = Credentials.from_service_account_file(CREDS_JSON, scopes=scopes)
+    gc   = gspread.authorize(cred)
+    sh   = gc.open_by_url(SPREADSHEET_URL)
+    return sh
+
+def _ensure_worksheet(sh, title: str):
+    try:
+        ws = sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows='2', cols=str(len(REQUIRED_COLUMNS)))
+        ws.update('A1', [REQUIRED_COLUMNS])
+    return ws
+
+def _ensure_required_columns(ws) -> List[str]:
+    header = ws.row_values(1)
+    header = [h for h in header if h]
+    if not header:
+        header = REQUIRED_COLUMNS.copy()
+        ws.update('A1', [header])
+        return header
+    missing = [c for c in REQUIRED_COLUMNS if c not in header]
+    if missing:
+        new_header = header + missing
+        # ajustar columnas si faltan
+        if ws.col_count < len(new_header):
+            try:
+                ws.add_cols(len(new_header) - ws.col_count)
+            except Exception:
+                pass
+        ws.update('A1', [new_header])
+        return new_header
+    return header
+
+def _align_df_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in columns:
+        if c not in out.columns:
+            out[c] = "" if c != "Precio" else pd.NA
+    return out[columns]
+
+def _get_existing_df(ws) -> pd.DataFrame:
+    # lectura segura de toda la hoja (hojas mensuales deben ser pequeñas)
+    df = get_as_dataframe(ws, dtype=str, header=0, evaluate_formulas=False).dropna(how='all')
+    return df if not df.empty else pd.DataFrame(columns=ws.row_values(1))
+
+def _append_rows(ws, df: pd.DataFrame):
+    # Convierte NaN a "" y fechas a texto
+    if "FechaConsulta" in df.columns:
+        df["FechaConsulta"] = pd.to_datetime(df["FechaConsulta"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    values = df.where(pd.notnull(df), "").values.tolist()
+    # Append en lotes para ser prudentes con el tamaño de request
+    chunk = 5000
+    for i in range(0, len(values), chunk):
+        ws.append_rows(values[i:i+chunk], value_input_option="USER_ENTERED")
+
+def _shrink_grid(ws, nrows: int, ncols: int):
+    # Compacta la grilla para no acumular celdas vacías (reduce el total de celdas del workbook)
+    try:
+        ws.resize(rows=max(1, nrows), cols=max(1, ncols))
+    except Exception:
+        # si falla (permisos/otros), simplemente continuar
+        pass
+
+def main() -> None:
+    # 1) Ejecutar scrapers y recolectar
+    all_rows: List[Dict] = []
+    for _, cls in SCRAPERS.items():
+        try:
+            rows = cls().scrape()
+            if rows:
+                all_rows.extend(rows)
+        except Exception:
+            # tolerante a fallos por sitio
+            pass
+
+    if not all_rows:
+        return
+
+    # 2) Consolidado y tipos
+    df_all = pd.DataFrame(all_rows)
+    # normalizar tipos
+    df_all["Precio"] = pd.to_numeric(df_all["Precio"], errors="coerce")
+    df_all = df_all[df_all["Precio"] > 0]
+    df_all["FechaConsulta"] = pd.to_datetime(df_all["FechaConsulta"], errors="coerce")
+    df_all = df_all.drop_duplicates(subset=KEY_COLS, keep="last")
+
+    # 3) Determinar partición mensual
+    # En una corrida normal todos comparten el mismo mes
+    if df_all["FechaConsulta"].notna().any():
+        part = df_all["FechaConsulta"].dt.strftime("%Y%m").iloc[0]
+    else:
+        part = datetime.now(timezone.utc).strftime("%Y%m")
+    target_title = f"{WORKSHEET_NAME}_{part}"
+
+    # 4) Abrir workbook y hoja mensual
+    sh = _authorize_sheet()
+    ws = _ensure_worksheet(sh, target_title)
+    header = _ensure_required_columns(ws)
+
+    # 5) Leer existente y alinear
+    prev_df = _get_existing_df(ws)
+    if prev_df.empty:
+        prev_df = pd.DataFrame(columns=header)
+    prev_df = _align_df_columns(prev_df, header)
+    df_all  = _align_df_columns(df_all, header)
+
+    # 6) Detección de nuevas filas por clave
+    for c in KEY_COLS:
+        if c not in prev_df.columns:
+            prev_df[c] = ""
+    if not prev_df.empty:
+        prev_keys = set(prev_df[KEY_COLS].astype(str).agg('|'.join, axis=1))
+    else:
+        prev_keys = set()
+    all_keys = df_all[KEY_COLS].astype(str).agg('|'.join, axis=1)
+    mask_new = ~all_keys.isin(prev_keys)
+    new_rows = df_all.loc[mask_new].copy()
+    if new_rows.empty:
+        # compactar (opcional) por si la hoja quedó grande
+        _shrink_grid(ws, nrows=len(prev_df)+1, ncols=len(header))
+        return
+
+    # 7) Ordenar columnas según encabezado y anexar
+    cols_to_write = [c for c in header if c in new_rows.columns]
+    new_rows = new_rows[cols_to_write]
+    _append_rows(ws, new_rows)
+
+    # 8) Compactar grilla para contener exactamente datos + encabezado
+    total_rows = 1 + len(prev_df) + len(new_rows)
+    _shrink_grid(ws, nrows=total_rows, ncols=len(header))
 
 if __name__ == "__main__":
-    gen = PriceReportGenerator()
-    ok = gen.generate_report()
-    # No prints (solo logging). Si no hay datos, el placeholder queda activo.
+    main()
